@@ -241,7 +241,7 @@ public class PacketCapture : IDisposable
         }
     }
 
-    private unsafe void HandleSyn(byte[] packet, int recvLen, ref WINDIVERT_ADDRESS addr,
+    private void HandleSyn(byte[] packet, int recvLen, ref WINDIVERT_ADDRESS addr,
         IPHDR ip, TCPHDR tcp, uint srcIp, uint dstIp, ushort srcPort, ushort dstPort, string key)
     {
         string dstStr = new IPAddress((long)dstIp).ToString();
