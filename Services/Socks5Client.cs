@@ -194,3 +194,21 @@ public class Socks5Client : IDisposable
         IsConnected = false;
     }
 }
+
+/// <summary>
+/// Factory for creating new SOCKS5 client connections.
+/// </summary>
+public class Socks5ClientFactory
+{
+    private readonly string _host;
+    private readonly int _port;
+    private readonly string _user;
+    private readonly string _pass;
+
+    public Socks5ClientFactory(string host, int port, string user, string pass)
+    {
+        _host = host; _port = port; _user = user; _pass = pass;
+    }
+
+    public Socks5Client Create() => new(_host, _port, _user, _pass);
+}

@@ -404,62 +404,64 @@ public class PacketCapture : IDisposable
         CleanupState(key, state);
     }
 
-    private unsafe void SendPacket(uint srcIp, uint dstIp, ushort srcPort, ushort dstPort,
+    private void SendPacket(uint srcIp, uint dstIp, ushort srcPort, ushort dstPort,
         uint seqNum, uint ackNum, byte flags, ushort window, byte[]? payload)
     {
-        int totalLen = Marshal.SizeOf<IPHDR>() + Marshal.SizeOf<TCPHDR>();
+        int ipHdrLen = Marshal.SizeOf<IPHDR>();
+        int tcpHdrLen = Marshal.SizeOf<TCPHDR>();
+        int totalLen = ipHdrLen + tcpHdrLen;
         if (payload != null) totalLen += payload.Length;
 
         if (totalLen > _injectBuf.Length) return;
-
-        // Clear buffer
         Array.Clear(_injectBuf, 0, totalLen);
 
-        // Build IP header
+        // Build and marshal IP header
         var ipHdr = new IPHDR
         {
-            VerLen = 0x45, // IPv4, 20 bytes header
+            VerLen = 0x45,
             Length = HostToNetwork16((ushort)totalLen),
             Id = HostToNetwork16((ushort)(new Random().Next() & 0xFFFF)),
             Ttl = 128,
-            Protocol = 6, // TCP
-            SrcAddr = dstIp,  // We send AS the server (was original dst)
-            DstAddr = srcIp   // To the client (was original src)
+            Protocol = 6,
+            SrcAddr = dstIp,
+            DstAddr = srcIp,
+            Checksum = 0
         };
-        ipHdr.Checksum = 0;
 
-        fixed (byte* ptr = _injectBuf)
+        var ipHdl = GCHandle.Alloc(_injectBuf, GCHandleType.Pinned);
+        try
         {
-            Marshal.StructureToPtr(ipHdr, (IntPtr)ptr, false);
+            IntPtr basePtr = ipHdl.AddrOfPinnedObject();
+            Marshal.StructureToPtr(ipHdr, basePtr, false);
 
             // Build TCP header
             var tcpHdr = new TCPHDR
             {
-                SrcPort = dstPort,  // Our response comes from server port
-                DstPort = srcPort,  // To client port
+                SrcPort = dstPort,
+                DstPort = srcPort,
                 SeqNum = seqNum,
                 AckNum = ackNum,
-                FlagsAndOffset = (ushort)(flags | 0x50), // HdrLen=5 (20 bytes)
+                FlagsAndOffset = (ushort)(flags | 0x50),
                 Window = HostToNetwork16(window),
                 Checksum = 0,
                 UrgPtr = 0
             };
 
-            int ipHdrLen = Marshal.SizeOf<IPHDR>();
-            Marshal.StructureToPtr(tcpHdr, (IntPtr)(ptr + ipHdrLen), false);
+            Marshal.StructureToPtr(tcpHdr, basePtr + ipHdrLen, false);
 
             // Copy payload
             if (payload != null && payload.Length > 0)
-            {
-                Marshal.Copy(payload, 0, (IntPtr)(ptr + ipHdrLen + Marshal.SizeOf<TCPHDR>()), payload.Length);
-            }
+                Marshal.Copy(payload, 0, basePtr + ipHdrLen + tcpHdrLen, payload.Length);
+        }
+        finally
+        {
+            ipHdl.Free();
         }
 
-        // Calculate checksums (WinDivert helper)
-        var addr = new WINDIVERT_ADDRESS { Direction = 0 }; // outbound
+        // Calculate checksums and inject
+        var addr = new WINDIVERT_ADDRESS { Direction = 0 };
         WinDivertHelperCalcChecksums(_injectBuf, totalLen, ref addr, 0);
 
-        // Inject the packet
         int sentLen = 0;
         WinDivertSend(_handle, _injectBuf, totalLen, ref addr, ref sentLen);
     }
