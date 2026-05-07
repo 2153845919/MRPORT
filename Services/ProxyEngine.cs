@@ -85,7 +85,7 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
 
         // Dynamic port listener (hosts file + WinDivert sniff + known port listeners)
         _dynListener = new DynamicPortListener(_clientFactory, _log, TargetDomain);
-        _dynListener.Start();
+        if (!await _dynListener.StartAsync()) { _log.Error("DynamicPortListener failed"); return false; }
 
         // Latency
         _latency = new LatencyMonitor(cfg.ServerAddress, cfg.ServerPort);

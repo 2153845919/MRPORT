@@ -12,10 +12,8 @@ using System.Threading.Tasks;
 namespace MRPORT.Services;
 
 /// <summary>
-/// WinDivert-based port sniffer.
-/// Captures SYNs to target IPs, dynamically creates port listeners on 127.0.0.1.
-/// Combined with hosts file redirect (domain → 127.0.0.1), this ensures
-/// all connections to the target (any port) get a local listener.
+/// Hosts redirect + port sniffing (WinDivert) + local listeners → SOCKS5.
+/// Known ports get immediate listeners; unknown ports get one on SYN sniff.
 /// </summary>
 public class DynamicPortListener : IDisposable
 {
@@ -55,10 +53,6 @@ public class DynamicPortListener : IDisposable
     private struct TCPHDR { public ushort SrcPort; public ushort DstPort; public uint SeqNum; public uint AckNum; public ushort FlagsAndOffset; public ushort Window; public ushort Checksum; public ushort UrgPtr; }
 
     private const int BufSize = 0xFFFF;
-    private const int SYN = 0x02;
-    private const int ACK = 0x10;
-
-    // Known ports that get pre-created listeners
     private static readonly int[] KnownPorts = [80, 443, 10012, 8080, 8443];
 
     private readonly Socks5ClientFactory _clientFactory;
@@ -66,9 +60,8 @@ public class DynamicPortListener : IDisposable
     private readonly string _targetDomain;
     private IntPtr _handle;
     private CancellationTokenSource? _cts;
-    private byte[][] _targetIps = [];
+    private volatile byte[][] _targetIps = [];
     private readonly ConcurrentDictionary<int, TcpListener> _listeners = new();
-    private TcpListener? _dummyListener;
 
     public bool IsRunning { get; private set; }
 
@@ -79,52 +72,52 @@ public class DynamicPortListener : IDisposable
         _targetDomain = targetDomain;
     }
 
-    public void Start()
+    /// <summary>Start on background thread, await completion of setup.</summary>
+    public Task<bool> StartAsync()
     {
-        if (IsRunning) return;
-        _cts = new CancellationTokenSource();
-
-        // Modify hosts file: cschannel.anticheatexpert.com → 127.0.0.1
-        ModifyHosts(add: true);
-
-        // Open WinDivert to sniff NEW TCP connections to target IPs
-        // Filter: outbound TCP SYNs only (non-loopback)
-        string filter = "outbound and tcp.Syn and not tcp.Ack and not ip.DstAddr == 127.0.0.1";
-        _handle = WinDivertOpen(filter, 0, 0, 0);
-        if (_handle == IntPtr.Zero)
+        return Task.Run(() =>
         {
-            _log.Error("WinDivertOpen failed");
-            return;
-        }
+            if (IsRunning) return true;
+            _cts = new CancellationTokenSource();
 
-        // Create listeners for known ports
-        CreatePortListener(80);
-        _log.Info("Known port listeners: 80, 443, 10012, 8080, 8443");
+            // 1. Hosts file redirect
+            try { ModifyHosts(add: true); } catch (Exception ex) { _log.Error($"Hosts: {ex.Message}"); return false; }
 
-        // DNS refresh
-        _ = DnsRefreshLoopAsync(_cts.Token);
-        _ = SniffLoopAsync();
-        IsRunning = true;
+            // 2. Open WinDivert (sniff only, pass through)
+            string filter = "outbound and tcp.Syn and not tcp.Ack and not ip.DstAddr == 127.0.0.1";
+            _handle = WinDivertOpen(filter, 0, 0, 0);
+            if (_handle == IntPtr.Zero) { _log.Error("WinDivertOpen failed"); return false; }
+            _log.Info("WinDivert opened");
+
+            // 3. Known port listeners
+            foreach (var port in KnownPorts)
+                TryCreateListener(port);
+
+            // 4. Background loops
+            _ = Task.Run(() => SniffLoop());
+            _ = Task.Run(() => DnsRefreshLoop());
+
+            IsRunning = true;
+            _log.Info("DynamicPortListener started");
+            return true;
+        });
     }
 
-    private void CreatePortListener(int port)
+    private void TryCreateListener(int port)
     {
         if (_listeners.ContainsKey(port)) return;
         try
         {
-            var listener = new TcpListener(IPAddress.Loopback, port);
-            listener.Start();
-            _listeners[port] = listener;
-            _ = AcceptLoopAsync(listener, port, _cts!.Token, isDynamic: false);
-            _log.Info($"Listener on 127.0.0.1:{port}");
+            var l = new TcpListener(IPAddress.Loopback, port);
+            l.Start();
+            _listeners[port] = l;
+            _ = AcceptLoopAsync(l, port, _cts!.Token, isDynamic: false);
+            _log.Info($"Listener 127.0.0.1:{port}");
         }
-        catch (Exception ex)
-        {
-            _log.Warn($"Can't listen on port {port}: {ex.Message}");
-        }
+        catch (Exception ex) { _log.Warn($"Port {port}: {ex.Message}"); }
     }
 
-    private async Task SniffLoopAsync()
+    private void SniffLoop()
     {
         byte[] buf = new byte[BufSize];
         var addr = new WINDIVERT_ADDRESS();
@@ -135,64 +128,67 @@ public class DynamicPortListener : IDisposable
             try
             {
                 if (!WinDivertRecv(_handle, buf, BufSize, ref addr, ref recvLen))
-                    continue;
+                { Thread.Sleep(10); continue; }
 
-                // Parse to get dest port
-                IntPtr ipH = IntPtr.Zero, ip6 = IntPtr.Zero, icmp = IntPtr.Zero, icmp6 = IntPtr.Zero;
-                IntPtr tcpH = IntPtr.Zero, udp = IntPtr.Zero, data = IntPtr.Zero;
-                int dLen = 0; IntPtr end = IntPtr.Zero;
+                // Parse packet
+                IntPtr ipH = IntPtr.Zero, tcpH = IntPtr.Zero;
+                IntPtr ip6 = IntPtr.Zero, icmp = IntPtr.Zero, icmp6 = IntPtr.Zero;
+                IntPtr udp = IntPtr.Zero, data = IntPtr.Zero; int dLen = 0; IntPtr end = IntPtr.Zero;
+                WinDivertHelperParsePacket(buf, recvLen, ref ipH, ref ip6, ref icmp, ref icmp6,
+                    ref tcpH, ref udp, ref data, ref dLen, ref end);
 
-                WinDivertHelperParsePacket(buf, recvLen, ref ipH, ref ip6, ref icmp, ref icmp6, ref tcpH, ref udp, ref data, ref dLen, ref end);
-                WinDivertSend(_handle, buf, recvLen, ref addr, ref recvLen); // always pass through
+                // Pass-through always
+                WinDivertSend(_handle, buf, recvLen, ref addr, ref recvLen);
 
                 if (ipH == IntPtr.Zero || tcpH == IntPtr.Zero) continue;
-
                 var ip = Marshal.PtrToStructure<IPHDR>(ipH);
                 var tcp = Marshal.PtrToStructure<TCPHDR>(tcpH);
 
                 byte flags = (byte)(tcp.FlagsAndOffset & 0xFF);
-                if ((flags & SYN) == 0 || (flags & ACK) != 0) continue;
+                if ((flags & 0x02) == 0 || (flags & 0x10) != 0) continue; // SYN only
 
                 var dstIp = new IPAddress(BitConverter.GetBytes(ip.DstAddr).Reverse().ToArray());
                 int dstPort = (ushort)IPAddress.NetworkToHostOrder((short)tcp.DstPort);
 
+                if (dstIp.Equals(IPAddress.Loopback)) continue;
                 if (!IsTargetIp(dstIp)) continue;
 
-                // Create listener dynamically for unknown ports
+                // Create listener on-demand
                 if (!_listeners.ContainsKey(dstPort))
                 {
                     try
                     {
-                        var listener = new TcpListener(IPAddress.Loopback, dstPort);
-                        listener.Start();
-                        _listeners[dstPort] = listener;
-                        _ = AcceptLoopAsync(listener, dstPort, _cts.Token, isDynamic: true);
-                        _log.Info($"Dynamic listener on port {dstPort}");
+                        var l = new TcpListener(IPAddress.Loopback, dstPort);
+                        l.Start();
+                        _listeners[dstPort] = l;
+                        _ = AcceptLoopAsync(l, dstPort, _cts.Token, isDynamic: true);
+                        _log.Info($"Dynamic listener port {dstPort}");
                     }
-                    catch { } // port might be in use
+                    catch { /* port in use or unavailable */ }
                 }
             }
-            catch { }
+            catch (Exception ex) { _log.Warn($"Sniff: {ex.Message}"); }
         }
     }
 
     private async Task AcceptLoopAsync(TcpListener listener, int port, CancellationToken ct, bool isDynamic)
     {
-        while (!ct.IsCancellationRequested)
+        try
         {
-            try
+            while (!ct.IsCancellationRequested)
             {
                 var client = await listener.AcceptTcpClientAsync(ct);
                 _ = RelayConnectionAsync(client, port);
             }
-            catch { break; }
         }
-
-        if (isDynamic)
+        catch { }
+        finally
         {
-            // Clean up dynamic listeners after use
-            try { listener.Stop(); } catch { }
-            _listeners.TryRemove(port, out _);
+            if (isDynamic)
+            {
+                try { listener.Stop(); } catch { }
+                _listeners.TryRemove(port, out _);
+            }
         }
     }
 
@@ -205,92 +201,65 @@ public class DynamicPortListener : IDisposable
             await socks.ConnectThroughProxyAsync(_targetDomain, port);
 
             using var clientStream = client.GetStream();
-            var relay = new TcpRelay(clientStream, socks.GetStream());
-            await relay.RunAsync(CancellationToken.None);
+            await new TcpRelay(clientStream, socks.GetStream()).RunAsync(CancellationToken.None);
         }
-        catch (Exception ex)
-        {
-            _log.Warn($"Relay port {port}: {ex.Message}");
-        }
-        finally
-        {
-            client.Dispose();
-        }
+        catch (Exception ex) { _log.Warn($"Relay port {port}: {ex.Message}"); }
+        finally { client.Dispose(); }
     }
 
     private bool IsTargetIp(IPAddress ip)
     {
         var b = ip.GetAddressBytes();
-        return _targetIps.Any(t => b[0] == t[0] && b[1] == t[1] && b[2] == t[2] && b[3] == t[3]);
+        return _targetIps.Any(t => b.AsSpan().SequenceEqual(t));
     }
 
-    private async Task DnsRefreshLoopAsync(CancellationToken ct)
+    private void DnsRefreshLoop()
     {
-        while (!ct.IsCancellationRequested)
+        while (!_cts!.IsCancellationRequested)
         {
             try
             {
-                var entry = await Dns.GetHostEntryAsync(_targetDomain, ct);
+                var entry = Dns.GetHostEntry(_targetDomain);
                 _targetIps = entry.AddressList
                     .Where(a => a.AddressFamily == AddressFamily.InterNetwork)
                     .Select(a => a.GetAddressBytes()).ToArray();
                 _log.Info($"DNS: {_targetDomain} -> {string.Join(", ", entry.AddressList.Select(a => a))}");
             }
             catch { }
-
-            try { await Task.Delay(60_000, ct); } catch { break; }
+            try { Task.Delay(60_000, _cts.Token).Wait(_cts.Token); } catch { break; }
         }
     }
 
     private static void ModifyHosts(bool add)
     {
-        try
-        {
-            string hostsPath = @"C:\Windows\System32\drivers\etc\hosts";
-            string entry = "127.0.0.1 cschannel.anticheatexpert.com";
-            var lines = System.IO.File.ReadAllLines(hostsPath).ToList();
-            bool exists = lines.Any(l => l.Contains("cschannel.anticheatexpert.com"));
+        string hostsPath = @"C:\Windows\System32\drivers\etc\hosts";
+        string entry = "127.0.0.1 cschannel.anticheatexpert.com";
+        var lines = File.ReadAllLines(hostsPath).ToList();
+        bool exists = lines.Any(l => l.Contains("cschannel.anticheatexpert.com"));
 
-            if (add && !exists)
-            {
-                lines.Add(entry);
-                System.IO.File.WriteAllLines(hostsPath, lines);
-            }
-            else if (!add && exists)
-            {
-                lines.RemoveAll(l => l.Contains("cschannel.anticheatexpert.com"));
-                System.IO.File.WriteAllLines(hostsPath, lines);
-            }
-        }
-        catch { }
+        if (add && !exists) { lines.Add(entry); File.WriteAllLines(hostsPath, lines); }
+        else if (!add && exists) { lines.RemoveAll(l => l.Contains("cschannel.anticheatexpert.com")); File.WriteAllLines(hostsPath, lines); }
     }
 
     public void Stop()
     {
+        if (!IsRunning) return;
         IsRunning = false;
         _cts?.Cancel();
         if (_handle != IntPtr.Zero) { WinDivertClose(_handle); _handle = IntPtr.Zero; }
         foreach (var (_, l) in _listeners) { try { l.Stop(); } catch { } }
         _listeners.Clear();
-        ModifyHosts(add: false);
-        _log.Info("Dynamic port listener stopped, hosts file restored");
+        try { ModifyHosts(add: false); } catch { }
+        _log.Info("DynamicPortListener stopped");
     }
 
-    public void Dispose()
-    {
-        Stop();
-        _cts?.Dispose();
-    }
+    public void Dispose() { Stop(); _cts?.Dispose(); }
 }
 
-/// <summary>
-/// Bidirectional TCP relay.
-/// </summary>
+/// <summary>Bidirectional TCP relay.</summary>
 public class TcpRelay
 {
-    private readonly NetworkStream _a;
-    private readonly NetworkStream _b;
-
+    private readonly NetworkStream _a, _b;
     public TcpRelay(NetworkStream a, NetworkStream b) { _a = a; _b = b; }
 
     public async Task RunAsync(CancellationToken ct)
