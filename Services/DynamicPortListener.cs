@@ -71,7 +71,8 @@ public class DynamicPortListener : IDisposable
             // 1. Add target IPs to loopback
             AddIpsToLoopback();
 
-            // 2. Setup portproxy: 127.0.0.1:80 → 127.0.0.1:21539
+            // 2. Clean stale portproxy (in case of crash), then add new one
+            RunNetshPortProxy("delete", 80, ForwardPort);
             RunNetshPortProxy("add", 80, ForwardPort);
             _log.Info($"Portproxy: 127.0.0.1:80 → 127.0.0.1:{ForwardPort}");
 
