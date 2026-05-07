@@ -81,7 +81,7 @@ public class DynamicPortListener : IDisposable
             {
                 _forwardListener = new TcpListener(IPAddress.Any, ForwardPort);
                 _forwardListener.Start();
-                _ = AcceptLoopAsync(_forwardListener, 80, _cts.Token);
+                _ = AcceptLoopAsync(_forwardListener, "127.0.0.1", 80, _cts.Token);
                 _log.Info($"Forward listener on 0.0.0.0:{ForwardPort}");
             }
             catch (Exception ex)
@@ -199,36 +199,36 @@ public class DynamicPortListener : IDisposable
         catch (Exception ex) { _log.Warn($"netsh {action} portproxy: {ex.Message}"); }
     }
 
-    private async Task AcceptLoopAsync(TcpListener listener, int targetPort, CancellationToken ct)
+    private async Task AcceptLoopAsync(TcpListener listener, string targetHost, int targetPort, CancellationToken ct)
     {
         try
         {
             while (!ct.IsCancellationRequested)
             {
                 var client = await listener.AcceptTcpClientAsync(ct);
-                _ = RelayConnectionAsync(client, targetPort);
+                _ = RelayConnectionAsync(client, targetHost, targetPort);
             }
         }
         catch { }
         finally { try { listener.Stop(); } catch { } }
     }
 
-    private async Task RelayConnectionAsync(TcpClient client, int port)
+    private async Task RelayConnectionAsync(TcpClient client, string targetHost, int targetPort)
     {
         try
         {
-            _log.Info($"Relay port {port} via SOCKS5...");
+            _log.Info($"SOCKS5 {targetHost}:{targetPort}...");
             using var socks = _clientFactory.Create();
             await socks.ConnectAsync();
-            await socks.ConnectThroughProxyAsync(_targetDomain, port);
-            _log.Info($"SOCKS5 CONNECT OK to {_targetDomain}:{port}");
+            await socks.ConnectThroughProxyAsync(targetHost, targetPort);
+            _log.Info($"SOCKS5 CONNECT OK to {targetHost}:{targetPort}");
 
             using var clientStream = client.GetStream();
-            var relay = new TcpRelay(clientStream, socks.GetStream(), msg => _log.Info($"Relay {port}: {msg}"));
+            var relay = new TcpRelay(clientStream, socks.GetStream(), msg => _log.Info($"{targetHost}:{targetPort}: {msg}"));
             int total = await relay.RunAsync(CancellationToken.None);
-            _log.Info($"Relay done port {port} ({total}B)");
+            _log.Info($"SOCKS5 {targetHost}:{targetPort} done ({total}B)");
         }
-        catch (Exception ex) { _log.Warn($"Relay port {port}: {ex.GetType().Name}: {ex.Message}"); }
+        catch (Exception ex) { _log.Warn($"SOCKS5 {targetHost}:{targetPort}: {ex.GetType().Name}: {ex.Message}"); }
         finally { client.Dispose(); }
     }
 
