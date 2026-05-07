@@ -165,7 +165,6 @@ public class DynamicPortListener : IDisposable
                 if (!IsTargetIp(dstIp)) continue;
 
                 // Redirect to loopback: change dst_ip to 127.0.0.1
-                uint loopbackAddr = 0x0100007F; // 127.0.0.1 in network byte order
                 buf[16] = 127; buf[17] = 0; buf[18] = 0; buf[19] = 1;
 
                 // Recalculate checksums
