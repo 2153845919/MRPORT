@@ -78,7 +78,7 @@ public class DynamicPortListener : IDisposable
             // 3. Listener on 0.0.0.0:21539 accepts redirected :80 traffic
             try
             {
-                _forwardListener = new TcpListener(IPAddress.Any, ForwardPort);
+                _forwardListener = new TcpListener(IPAddress.Loopback, ForwardPort);
                 _forwardListener.Start();
                 _ = AcceptLoopAsync(_forwardListener, 80, _cts.Token);
                 _log.Info($"Forward listener on 0.0.0.0:{ForwardPort}");
@@ -181,11 +181,21 @@ public class DynamicPortListener : IDisposable
                 ? $"interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport={fromPort} connectaddress=127.0.0.1 connectport={toPort}"
                 : $"interface portproxy delete v4tov4 listenaddress=127.0.0.1 listenport={fromPort}";
 
-            using var p = Process.Start(new ProcessStartInfo("netsh", args)
-            { CreateNoWindow = true, UseShellExecute = false });
-            p?.WaitForExit(2000);
+            var psi = new ProcessStartInfo("netsh", args)
+            {
+                CreateNoWindow = true, UseShellExecute = false,
+                RedirectStandardOutput = true, RedirectStandardError = true
+            };
+            using var p = Process.Start(psi);
+            p?.WaitForExit(3000);
+            var outText = p?.StandardOutput.ReadToEnd() ?? "";
+            var errText = p?.StandardError.ReadToEnd() ?? "";
+            if (!string.IsNullOrEmpty(errText))
+                _log.Warn($"netsh {action} portproxy: {errText.Trim()}");
+            else
+                _log.Info($"netsh {action} portproxy OK");
         }
-        catch { }
+        catch (Exception ex) { _log.Warn($"netsh {action} portproxy: {ex.Message}"); }
     }
 
     private async Task AcceptLoopAsync(TcpListener listener, int targetPort, CancellationToken ct)
@@ -268,10 +278,10 @@ public class DynamicPortListener : IDisposable
         _sniffThread?.Join(1000);
         _sniffThread = null;
 
-        // Close listener
+        // Close listener first (so portproxy can be deleted)
         try { _forwardListener?.Stop(); } catch { }
 
-        // Remove portproxy
+        // Remove portproxy (must be after listener close)
         RunNetshPortProxy("delete", 80, ForwardPort);
 
         // Remove loopback IPs
@@ -287,6 +297,22 @@ public class DynamicPortListener : IDisposable
             }
             catch { }
         }
+
+        // Verify cleanup
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo("netsh",
+                "interface portproxy show all")
+            {
+                CreateNoWindow = true, UseShellExecute = false,
+                RedirectStandardOutput = true
+            });
+            p?.WaitForExit(1000);
+            var show = p?.StandardOutput.ReadToEnd() ?? "";
+            if (show.Contains("127.0.0.1")) _log.Warn("Cleanup: portproxy still exists!");
+            else _log.Info("Cleanup confirmed: no portproxy rules remain");
+        }
+        catch { }
 
         _log.Info("MRPORT stopped");
     }

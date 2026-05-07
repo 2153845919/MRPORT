@@ -34,6 +34,9 @@ public partial class MainWindow : Window
         if (!string.IsNullOrEmpty(cfg.LastRunTime))
             LastRunText.Text = cfg.LastRunTime;
 
+        // Register process-exit cleanup for netsh portproxy
+        _engine.RegisterCleanup();
+
         // Load announcement
         LoadAnnouncementAsync();
     }

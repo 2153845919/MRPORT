@@ -171,4 +171,14 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
         _latency?.Dispose();
         _guard?.Dispose();
     }
+
+    /// <summary>
+    /// Register process-exit handler to clean up netsh portproxy
+    /// even if UI doesn't call Stop().
+    /// </summary>
+    public void RegisterCleanup()
+    {
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => { Stop(); _dynListener?.Dispose(); };
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; Stop(); };
+    }
 }
