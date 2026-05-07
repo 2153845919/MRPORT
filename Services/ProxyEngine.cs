@@ -15,11 +15,8 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
     private readonly LogService _log;
     private readonly Socks5ClientFactory _clientFactory;
     private PacketCapture? _capture;
-    private LocalProxyServer? _proxy;
     private LatencyMonitor? _latency;
     private ProcessGuard? _guard;
-
-
 
     public const int LocalProxyPort = 21539;
 
@@ -96,17 +93,12 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
             return false;
         }
 
-        // Start local proxy server
-        _proxy = new LocalProxyServer(LocalProxyPort, _clientFactory);
-        _proxy.Start();
-        _log.Info($"Local proxy started on 127.0.0.1:{LocalProxyPort}");
-
-        // Start packet capture (redirects matching traffic to local proxy)
-        _capture = new PacketCapture(_clientFactory, LocalProxyPort, _log);
+        // Start packet capture (TCP MITM transparent proxy via WinDivert)
+        _capture = new PacketCapture(_clientFactory, _log);
         _capture.Start();
-        _log.Info("Packet capture started");
+        _log.Info("Packet capture (TCP transparent proxy) started");
 
-        // Start latency monitor (direct connection to SOCKS5 server)
+        // Start latency monitor (direct TCP to SOCKS5 server)
         _latency = new LatencyMonitor(cfg.ServerAddress, cfg.ServerPort);
         _latency.OnLatencyUpdated += OnLatencyUpdated;
         _latency.Start();
@@ -133,7 +125,6 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
         _log.Info("Stopping proxy engine...");
 
         _capture?.Stop();
-        _proxy?.Stop();
         _latency?.Stop();
         _guard?.Dispose();
 
@@ -207,7 +198,6 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
     {
         Stop();
         _capture?.Dispose();
-        _proxy?.Dispose();
         _latency?.Dispose();
         _guard?.Dispose();
     }

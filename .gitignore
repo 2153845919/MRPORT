@@ -1,0 +1,8 @@
+# Binaries
+WinDivert/
+out/
+bin/
+obj/
+*.user
+*.suo
+.vs/
