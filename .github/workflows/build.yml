@@ -25,13 +25,15 @@ jobs:
     - name: Download WinDivert
       shell: pwsh
       run: |
-        $version = "2.2.0"
-        $url = "https://github.com/basil00/WinDivert/releases/download/v$version/WinDivert-$version-x64.zip"
+        $version = "2.2.2"
+        $arch = "A"
+        $url = "https://github.com/basil00/WinDivert/releases/download/v$version/WinDivert-$version-$arch.zip"
         Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\windivert.zip"
         Expand-Archive -Path "$env:TEMP\windivert.zip" -DestinationPath "$env:TEMP\windivert-extract" -Force
+        $extracted = Get-ChildItem "$env:TEMP\windivert-extract" -Directory | Select-Object -First 1
         New-Item -ItemType Directory -Force -Path WinDivert
-        Copy-Item "$env:TEMP\windivert-extract\x64\WinDivert64.sys" -Destination WinDivert/
-        Copy-Item "$env:TEMP\windivert-extract\x64\WinDivert.dll" -Destination WinDivert/
+        Copy-Item "$($extracted.FullName)\x64\WinDivert64.sys" -Destination WinDivert/
+        Copy-Item "$($extracted.FullName)\x64\WinDivert.dll" -Destination WinDivert/
 
     - name: Build
       shell: pwsh
