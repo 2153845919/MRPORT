@@ -10,7 +10,7 @@ namespace MRPORT.Services;
 
 public class AnnouncementService
 {
-    private static readonly string AnnouncementUrl = "https://share.note.youdao.com/s/VB2TZZPc";
+    private static readonly string AnnouncementUrl = "https://luoke-1313441516.cos.ap-guangzhou.myqcloud.com/gongao.txt";
 
     public async Task<string> FetchAsync()
     {
@@ -18,8 +18,8 @@ public class AnnouncementService
         {
             using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
             client.DefaultRequestHeaders.UserAgent.ParseAdd("MRPORT/1.0");
-            var html = await client.GetStringAsync(AnnouncementUrl);
-            return StripHtml(html);
+            var text = await client.GetStringAsync(AnnouncementUrl);
+            return text.Trim();
         }
         catch (Exception ex)
         {
@@ -27,17 +27,5 @@ public class AnnouncementService
         }
     }
 
-    private static string StripHtml(string html)
-    {
-        var sb = new StringBuilder();
-        bool inTag = false;
-        foreach (char c in html)
-        {
-            if (c == '<') inTag = true;
-            else if (c == '>') inTag = false;
-            else if (!inTag) sb.Append(c);
-        }
-        var text = sb.ToString().Trim();
-        return string.IsNullOrWhiteSpace(text) ? html : text;
-    }
+    // Text is fetched as plain text from the new URL - no HTML stripping needed
 }
