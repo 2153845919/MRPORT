@@ -1,0 +1,151 @@
+<Window x:Class="MRPORT.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="MRPORT-过检测 v1.0"
+        Height="640" Width="480"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="SingleBorderWindow"
+        ResizeMode="CanResize"
+        Background="{StaticResource BgDarkBrush}"
+        Foreground="{StaticResource TextPrimaryBrush}">
+
+    <Border CornerRadius="0" Background="{StaticResource BgDarkBrush}" Padding="16">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <!-- Title -->
+            <TextBlock Grid.Row="0" FontSize="20" FontWeight="Bold"
+                       Foreground="{StaticResource CyanBrush}"
+                       Text="MRPORT-过检测" Margin="0,0,0,4" />
+            <TextBlock Grid.Row="0" FontSize="12"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       Text="v1.0" HorizontalAlignment="Right"
+                       VerticalAlignment="Bottom" Margin="0,0,0,4" />
+
+            <!-- Announcement -->
+            <Border Grid.Row="1" Background="{StaticResource BgPanelBrush}"
+                    BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+                    CornerRadius="6" Padding="8" Margin="0,0,0,8">
+                <TextBox x:Name="AnnouncementBox"
+                         Style="{StaticResource LogTextBox}"
+                         Height="60"
+                         Text="正在加载公告..." />
+            </Border>
+
+            <!-- Credentials -->
+            <Grid Grid.Row="2" Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="60" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="60" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <TextBlock Grid.Column="0" Text="账号:" VerticalAlignment="Center"
+                           Foreground="{StaticResource TextSecondaryBrush}" />
+                <TextBox x:Name="UsernameBox" Grid.Column="1"
+                         Style="{StaticResource ModernTextBox}" Margin="0,0,8,0" />
+
+                <TextBlock Grid.Column="2" Text="密码:" VerticalAlignment="Center"
+                           Foreground="{StaticResource TextSecondaryBrush}" />
+                <PasswordBox x:Name="PasswordBox" Grid.Column="3"
+                             Style="{StaticResource ModernPasswordBox}" />
+            </Grid>
+
+            <!-- Buttons row 1 -->
+            <Grid Grid.Row="3" Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Button Grid.Column="0" Content="💾 保存"
+                        Style="{StaticResource ModernButton}"
+                        Click="OnSaveClick" Margin="0,0,4,0" />
+                <Button Grid.Column="1" Content="🌐 验证"
+                        Style="{StaticResource ModernButton}"
+                        Click="OnVerifyClick" Margin="4,0,4,0" />
+                <Button x:Name="EditBtn" Grid.Column="2" Content="✏️ 编辑公告"
+                        Style="{StaticResource ModernButton}"
+                        Click="OnEditAnnouncementClick" Margin="4,0,0,0" />
+            </Grid>
+
+            <!-- Buttons row 2 -->
+            <Grid Grid.Row="4" Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Button x:Name="StartBtn" Grid.Column="0"
+                        Content="▶ 启动"
+                        Style="{StaticResource GreenButton}"
+                        Click="OnStartClick" Margin="0,0,4,0"
+                        Height="40" />
+                <Button x:Name="StopBtn" Grid.Column="1"
+                        Content="⏹ 停止"
+                        Style="{StaticResource RedButton}"
+                        Click="OnStopClick" Margin="4,0,0,0"
+                        Height="40" IsEnabled="False" />
+            </Grid>
+
+            <!-- Status info -->
+            <Border Grid.Row="5" Background="{StaticResource BgPanelBrush}"
+                    BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+                    CornerRadius="6" Padding="10" Margin="0,0,0,8">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="当前延迟:" 
+                               Foreground="{StaticResource TextSecondaryBrush}" FontSize="13" />
+                    <TextBlock x:Name="LatencyText" Grid.Row="0" Grid.Column="1"
+                               Text="--" FontSize="14" FontWeight="Bold"
+                               Foreground="{StaticResource TextSecondaryBrush}" />
+
+                    <TextBlock Grid.Row="0" Grid.Column="2" Text="已运行:"
+                               Foreground="{StaticResource TextSecondaryBrush}" FontSize="13" />
+                    <TextBlock x:Name="RunTimeText" Grid.Row="0" Grid.Column="3"
+                               Text="00:00:00" FontSize="14" FontWeight="Bold"
+                               Foreground="{StaticResource CyanBrush}" />
+
+                    <TextBlock Grid.Row="1" Grid.Column="0" Text="上次运行:"
+                               Foreground="{StaticResource TextSecondaryBrush}" FontSize="13" Margin="0,4,0,0" />
+                    <TextBlock x:Name="LastRunText" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="3"
+                               Text="" FontSize="13"
+                               Foreground="{StaticResource TextSecondaryBrush}" Margin="0,4,0,0" />
+                </Grid>
+            </Border>
+
+            <!-- Error log label -->
+            <TextBlock Grid.Row="6" Text="错误日志:"
+                       Foreground="{StaticResource TextSecondaryBrush}"
+                       FontSize="13" Margin="0,0,0,4" />
+
+            <!-- Error log -->
+            <TextBox x:Name="LogBox" Grid.Row="7" Grid.RowSpan="3"
+                     Style="{StaticResource LogTextBox}"
+                     VerticalAlignment="Stretch" />
+        </Grid>
+    </Border>
+</Window>
