@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -12,15 +13,13 @@ using System.Threading.Tasks;
 namespace MRPORT.Services;
 
 /// <summary>
-/// WinDivert SYN redirect + local listener proxy.
+/// WinDivert-assisted transparent proxy.
 ///
-/// Outbound TCP SYNs:
-///   → target IP: modify dst_ip to 127.0.0.1, same port
-///   → 127.0.0.1:80: modify dst_port to loopbackFallbackPort (avoid port conflict)
-///   → anything else: pass through unmodified
-///
-/// Game kernel completes TCP handshake with our listener normally.
-/// Accepted connections → SOCKS5 forward to cschannel.anticheatexpert.com:samePort.
+/// 1. Add target IPs to loopback interface (routes traffic locally).
+/// 2. WinDivert captures first SYN to each target IP:port → consume it, create listener.
+/// 3. Game retransmits SYN → listener accepts → TCP handshake → SOCKS5 forward.
+/// 4. 127.0.0.1:80 → WinDivert modifies dst_port to 21539 → listener on 21539.
+/// 5. No packet modification for target IPs (they're already on loopback).
 /// </summary>
 public class DynamicPortListener : IDisposable
 {
@@ -45,15 +44,6 @@ public class DynamicPortListener : IDisposable
     private static extern bool WinDivertHelperCalcChecksums(byte[] pPacket, int packetLen,
         ref WINDIVERT_ADDRESS pAddr, ulong flags);
 
-    [DllImport("WinDivert.dll", CallingConvention = CallingConvention.Cdecl)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool WinDivertHelperParsePacket(byte[] pPacket, int packetLen,
-        ref IntPtr ppIpHdr, ref IntPtr ppIpv6Hdr,
-        ref IntPtr ppIcmpHdr, ref IntPtr ppIcmpv6Hdr,
-        ref IntPtr ppTcpHdr, ref IntPtr ppUdpHdr,
-        ref IntPtr ppData, ref int pDataLen,
-        ref IntPtr ppEnd);
-
     [StructLayout(LayoutKind.Sequential)]
     private struct WINDIVERT_ADDRESS { public int IfIdx; public int SubIfIdx; public byte Direction; public byte R1; public byte R2; public byte R3; }
 
@@ -68,7 +58,10 @@ public class DynamicPortListener : IDisposable
     private volatile byte[][] _targetIps = [];
     private readonly ConcurrentDictionary<int, TcpListener> _listeners = new();
     private Thread? _sniffThread;
-    private TcpListener? _loopbackFallbackListener;
+    private TcpListener? _fallbackListener;
+
+    // Track first-SYN-consumed per port so we only create each listener once
+    private readonly HashSet<int> _createdPorts = new();
 
     public bool IsRunning { get; private set; }
 
@@ -86,38 +79,50 @@ public class DynamicPortListener : IDisposable
             if (IsRunning) return true;
             _cts = new CancellationTokenSource();
 
-            // Resolve real IPs (no hosts file modification!)
+            // Resolve target IPs
             if (!ResolveTargetIps()) return false;
 
-            // Copy WinDivert files to TEMP so user can delete app folder freely
+            // Copy WinDivert to TEMP
             CopyToTempIfNeeded();
 
-            // Open WinDivert: capture ALL outbound TCP SYNs (including loopback)
-            string filter = "outbound and tcp.Syn and not tcp.Ack";
-            // Negative priority to capture loopback traffic too
-            _handle = WinDivertOpen(filter, 0, (short)-100, 0);
-            if (_handle == IntPtr.Zero) { _log.Error("WinDivertOpen failed"); return false; }
-            _log.Info("WinDivert SYN redirect started");
+            // Add target IPs to loopback interface
+            foreach (var ipBytes in _targetIps)
+            {
+                var ip = new IPAddress(ipBytes);
+                var psi = new ProcessStartInfo("netsh", $"int ip add address Loopback {ip} 255.255.255.255")
+                {
+                    CreateNoWindow = true, UseShellExecute = false,
+                    RedirectStandardOutput = true, RedirectStandardError = true
+                };
+                using var p = Process.Start(psi);
+                p?.WaitForExit(3000);
+            }
+            _log.Info($"Added {_targetIps.Length} IPs to loopback");
 
-            // Fallback listener for 127.0.0.1:80 → 127.0.0.1:21539 redirection
+            // Open WinDivert (negative priority for loopback capture)
+            // Filter: all TCP SYNs (no direction to catch both loopback and physical)
+            _handle = WinDivertOpen("tcp.Syn and not tcp.Ack", 0, (short)-100, 0);
+            if (_handle == IntPtr.Zero) { _log.Error("WinDivertOpen failed"); return false; }
+            _log.Info("WinDivert started (loopback mode)");
+
+            // Fallback listener for 127.0.0.1:80 → 21539
             try
             {
-                _loopbackFallbackListener = new TcpListener(IPAddress.Loopback, LoopbackFallbackPort);
-                _loopbackFallbackListener.Start();
-                _ = AcceptLoopAsync(_loopbackFallbackListener, 80, _cts.Token, isDynamic: false);
-                _log.Info($"Fallback listener 127.0.0.1:{LoopbackFallbackPort} (for :80)");
+                _fallbackListener = new TcpListener(IPAddress.Loopback, LoopbackFallbackPort);
+                _fallbackListener.Start();
+                _ = AcceptLoopAsync(_fallbackListener, 80, _cts.Token);
             }
-            catch (Exception ex) { _log.Warn($"Fallback port {LoopbackFallbackPort}: {ex.Message}"); return false; }
+            catch (Exception ex) { _log.Warn($"Fallback port: {ex.Message}"); return false; }
 
             // Sniff thread
-            _sniffThread = new Thread(SniffLoop) { IsBackground = true, Name = "WinDivertSniff" };
+            _sniffThread = new Thread(SniffLoop) { IsBackground = true, Name = "WinDivert" };
             _sniffThread.Start();
 
             // DNS refresh
             _ = Task.Run(DnsRefreshLoop);
 
             IsRunning = true;
-            _log.Info($"MRPORT active, redirecting {_targetIps.Length} target IPs to SOCKS5");
+            _log.Info("MRPORT active");
             return true;
         });
     }
@@ -130,7 +135,7 @@ public class DynamicPortListener : IDisposable
             _targetIps = entry.AddressList
                 .Where(a => a.AddressFamily == AddressFamily.InterNetwork)
                 .Select(a => a.GetAddressBytes()).Distinct(BytesComparer.Instance).ToArray();
-            _log.Info($"Target IPs: {string.Join(", ", _targetIps.Select(b => new IPAddress(b)))}");
+            _log.Info($"Targets: {string.Join(", ", _targetIps.Select(b => new IPAddress(b)))}");
             return _targetIps.Length > 0;
         }
         catch (Exception ex) { _log.Error($"DNS: {ex.Message}"); return false; }
@@ -138,21 +143,17 @@ public class DynamicPortListener : IDisposable
 
     private static void CopyToTempIfNeeded()
     {
-        string localDir = AppDomain.CurrentDomain.BaseDirectory;
-        string tempDir = Path.Combine(Path.GetTempPath(), "MRPORT");
-        Directory.CreateDirectory(tempDir);
-
-        string[] files = ["WinDivert64.sys", "WinDivert.dll"];
-        foreach (var f in files)
+        string local = AppDomain.CurrentDomain.BaseDirectory;
+        string temp = Path.Combine(Path.GetTempPath(), "MRPORT");
+        Directory.CreateDirectory(temp);
+        foreach (var f in new[] { "WinDivert64.sys", "WinDivert.dll" })
         {
-            string src = Path.Combine(localDir, f);
-            string dst = Path.Combine(tempDir, f);
+            string src = Path.Combine(local, f);
+            string dst = Path.Combine(temp, f);
             if (File.Exists(src) && (!File.Exists(dst) || File.GetLastWriteTimeUtc(src) > File.GetLastWriteTimeUtc(dst)))
                 File.Copy(src, dst, true);
         }
-
-        // Change working directory so WinDivert loads from TEMP
-        Environment.CurrentDirectory = tempDir;
+        Environment.CurrentDirectory = temp;
     }
 
     private void SniffLoop()
@@ -167,74 +168,72 @@ public class DynamicPortListener : IDisposable
             {
                 if (!WinDivertRecv(_handle, buf, BufSize, ref addr, ref recvLen))
                 { Thread.Sleep(10); continue; }
-                if (recvLen < 40) continue;
-                if ((buf[0] & 0xF0) != 0x40) continue; // IPv4 only
+                if (recvLen < 40 || (buf[0] & 0xF0) != 0x40) continue;
 
                 int ipHdrLen = (buf[0] & 0x0F) * 4;
                 int tcpOff = ipHdrLen;
                 if (tcpOff + 14 > recvLen) continue;
 
-                // Parse TCP flags
+                // TCP flags
                 byte flags = buf[tcpOff + 13];
-                if ((flags & 0x02) == 0 || (flags & 0x10) != 0) continue; // SYN only, not SYN-ACK
+                if ((flags & 0x02) == 0 || (flags & 0x10) != 0) continue;
 
-                uint dstAddr = (uint)(buf[16] | (buf[17] << 8) | (buf[18] << 16) | (buf[19] << 24));
+                // Read IPv4 destination address (network byte order in packet)
+                var dstIp = new IPAddress(new[] { buf[16], buf[17], buf[18], buf[19] });
                 int dstPort = (buf[tcpOff] << 8) | buf[tcpOff + 1];
-                var dstIp = new IPAddress(BitConverter.GetBytes(dstAddr).Reverse().ToArray());
 
-                if (dstIp.Equals(IPAddress.Loopback))
+                // --- 127.0.0.1:80 → redirect to fallback port ---
+                if (dstIp.Equals(IPAddress.Loopback) && dstPort == 80)
                 {
-                    // Loopback traffic: only handle port 80
-                    if (dstPort == 80)
-                    {
-                        // Redirect 127.0.0.1:80 → 127.0.0.1:21539
-                        buf[tcpOff] = (byte)(LoopbackFallbackPort >> 8);
-                        buf[tcpOff + 1] = (byte)(LoopbackFallbackPort & 0xFF);
-
-                        WinDivertHelperCalcChecksums(buf, recvLen, ref addr, 0);
-                        WinDivertSend(_handle, buf, recvLen, ref addr, ref recvLen);
-                        _log.Info($"Redirect :80 → :{LoopbackFallbackPort}");
-                    }
-                    // Other loopback: pass through (WinDivertSend without modifications)
-                    else
-                    {
-                        WinDivertSend(_handle, buf, recvLen, ref addr, ref recvLen);
-                    }
+                    buf[tcpOff] = (byte)(LoopbackFallbackPort >> 8);
+                    buf[tcpOff + 1] = (byte)(LoopbackFallbackPort & 0xFF);
+                    WinDivertHelperCalcChecksums(buf, recvLen, ref addr, 0);
+                    WinDivertSend(_handle, buf, recvLen, ref addr, ref recvLen);
                     continue;
                 }
 
-                // Non-loopback: check if target IP
+                // Pass through if not a target IP
                 if (!IsTargetIp(dstIp))
                 {
                     WinDivertSend(_handle, buf, recvLen, ref addr, ref recvLen);
                     continue;
                 }
 
-                // Redirect to loopback
-                buf[16] = 127; buf[17] = 0; buf[18] = 0; buf[19] = 1;
-                WinDivertHelperCalcChecksums(buf, recvLen, ref addr, 0);
-                WinDivertSend(_handle, buf, recvLen, ref addr, ref recvLen);
-                _log.Info($"Redirect {dstIp}:{dstPort} → 127.0.0.1:{dstPort}");
-
-                // Ensure listener exists
-                if (!_listeners.ContainsKey(dstPort))
+                // --- Target IP: consume first SYN, create listener ---
+                lock (_createdPorts)
                 {
-                    try
+                    if (!_createdPorts.Contains(dstPort))
                     {
-                        var l = new TcpListener(IPAddress.Loopback, dstPort);
-                        l.Start();
-                        _listeners[dstPort] = l;
-                        _ = AcceptLoopAsync(l, dstPort, _cts.Token, isDynamic: true);
-                        _log.Info($"Dynamic listener port {dstPort}");
+                        _createdPorts.Add(dstPort);
+                        // DON'T send: consume this SYN so game waits/retransmits
+                        // Create listener on the target IP (now on loopback)
+                        CreateTargetListener(dstIp, dstPort);
+                        _log.Info($"First SYN consumed, creating listener for {dstIp}:{dstPort}");
+                        continue;
                     }
-                    catch { }
                 }
+
+                // Subsequent SYN: pass through, listener should be ready
+                WinDivertSend(_handle, buf, recvLen, ref addr, ref recvLen);
             }
             catch (Exception ex) { _log.Warn($"Sniff: {ex.Message}"); }
         }
     }
 
-    private async Task AcceptLoopAsync(TcpListener listener, int realPort, CancellationToken ct, bool isDynamic)
+    private void CreateTargetListener(IPAddress ip, int port)
+    {
+        try
+        {
+            var l = new TcpListener(ip, port);
+            l.Start();
+            _listeners[port] = l;
+            _ = AcceptLoopAsync(l, port, _cts!.Token);
+            _log.Info($"Listener {ip}:{port}");
+        }
+        catch (Exception ex) { _log.Warn($"Create listener {ip}:{port}: {ex.Message}"); }
+    }
+
+    private async Task AcceptLoopAsync(TcpListener listener, int realPort, CancellationToken ct)
     {
         try
         {
@@ -245,14 +244,7 @@ public class DynamicPortListener : IDisposable
             }
         }
         catch { }
-        finally
-        {
-            if (isDynamic)
-            {
-                try { listener.Stop(); } catch { }
-                if (_listeners.TryRemove(realPort, out _)) { }
-            }
-        }
+        finally { try { listener.Stop(); } catch { } }
     }
 
     private async Task RelayConnectionAsync(TcpClient client, int port)
@@ -266,6 +258,7 @@ public class DynamicPortListener : IDisposable
             using var clientStream = client.GetStream();
             var relay = new TcpRelay(clientStream, socks.GetStream());
             await relay.RunAsync(CancellationToken.None);
+            _log.Info($"Relay done port {port}");
         }
         catch (Exception ex) { _log.Warn($"Relay port {port}: {ex.Message}"); }
         finally { client.Dispose(); }
@@ -299,20 +292,28 @@ public class DynamicPortListener : IDisposable
         IsRunning = false;
         _cts?.Cancel();
 
-        // Close WinDivert handle — immediately unblocks pending WinDivertRecv
+        // Close WinDivert handle first (unblocks sniff thread)
         var h = _handle;
         _handle = IntPtr.Zero;
-        if (h != IntPtr.Zero) WinDivertClose(h); // fast: signals the handle, recv returns FALSE
-
-        // Join sniff thread (should exit quickly after WinDivertClose)
+        if (h != IntPtr.Zero) WinDivertClose(h);
         _sniffThread?.Join(2000);
         _sniffThread = null;
 
-        // Close all listeners
-        try { _loopbackFallbackListener?.Stop(); } catch { }
+        // Close listeners
+        try { _fallbackListener?.Stop(); } catch { }
         foreach (var (_, l) in _listeners) { try { l.Stop(); } catch { } }
         _listeners.Clear();
+        _createdPorts.Clear();
 
+        // Remove target IPs from loopback
+        foreach (var ipBytes in _targetIps)
+        {
+            var ip = new IPAddress(ipBytes);
+            var psi = new ProcessStartInfo("netsh", $"int ip delete address Loopback {ip}")
+            { CreateNoWindow = true, UseShellExecute = false };
+            using var p = Process.Start(psi);
+            p?.WaitForExit(1000);
+        }
         _log.Info("MRPORT stopped");
     }
 
