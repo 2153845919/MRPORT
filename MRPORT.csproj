@@ -21,7 +21,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="WinDivert\*.*" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="WinDivert\WinDivert.dll" Link="WinDivert.dll" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="WinDivert\WinDivert64.sys" Link="WinDivert64.sys" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
