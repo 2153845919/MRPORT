@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -13,12 +12,10 @@ using System.Threading.Tasks;
 namespace MRPORT.Services;
 
 /// <summary>
-/// Hybrid transparent proxy:
-/// 1. netsh portproxy: 127.0.0.1:80 → 127.0.0.1:21539 (kernel-level, no driver needed)
-/// 2. Target IPs added to loopback (routes via local)
-/// 3. WinDivert (if available) sniffs inbound to target IPs for dynamic port detection
-/// 4. TcpListener on 0.0.0.0:21539 accepts redirected :80 traffic → SOCKS5 forward
-/// 5. TcpListener on target IP:port (dynamic) accepts → SOCKS5 forward
+/// Transparent SOCKS5 proxy using:
+/// 1. netsh portproxy: 127.0.0.1:80/443 → local fallback ports → SOCKS5
+/// 2. hosts file redirect: cschannel.anticheatexpert.com → 127.0.0.1
+/// 3. Target IPs on loopback + WinDivert sniff (best-effort)
 /// </summary>
 public class DynamicPortListener : IDisposable
 {
@@ -38,13 +35,15 @@ public class DynamicPortListener : IDisposable
     private struct WINDIVERT_ADDRESS { public int IfIdx; public int SubIfIdx; public byte Direction; public byte R1; public byte R2; public byte R3; }
 
     private const int BufSize = 0xFFFF;
-    private const int ForwardPort = 21539; // 127.0.0.1:80 → :21539
+    private const int ForwardPort80 = 21539;
+    private const int ForwardPort443 = 21540;
+    private const string HostsPath = @"C:\Windows\System32\drivers\etc\hosts";
 
     private readonly Socks5ClientFactory _clientFactory;
     private readonly LogService _log;
     private readonly string _targetDomain;
     private volatile byte[][] _targetIps = [];
-    private TcpListener? _forwardListener;
+    private readonly List<TcpListener> _listeners = new();
     private CancellationTokenSource? _cts;
     private IntPtr _windivertHandle;
     private Thread? _sniffThread;
@@ -68,36 +67,93 @@ public class DynamicPortListener : IDisposable
             if (!ResolveTargetIps()) return false;
             CopyToTempIfNeeded();
 
-            // 1. Add target IPs to loopback
+            // 1. Hosts redirect: cschannel.anticheatexpert.com → 127.0.0.1
+            AddHostsRedirect();
+
+            // 2. Add target IPs to loopback
             AddIpsToLoopback();
 
-            // 2. Clean stale portproxy (in case of crash), then add new one
-            RunNetshPortProxy("delete", 80, ForwardPort);
-            RunNetshPortProxy("add", 80, ForwardPort);
-            _log.Info($"Portproxy: 127.0.0.1:80 → 127.0.0.1:{ForwardPort}");
+            // 3. Portproxy: 127.0.0.1:80 → :21539, 127.0.0.1:443 → :21540
+            StartPortProxy();
 
-            // 3. Listener on 0.0.0.0:21539 accepts redirected :80 traffic
-            try
-            {
-                _forwardListener = new TcpListener(IPAddress.Any, ForwardPort);
-                _forwardListener.Start();
-                _ = AcceptLoopAsync(_forwardListener, "127.0.0.1", 80, _cts.Token);
-                _log.Info($"Forward listener on 0.0.0.0:{ForwardPort}");
-            }
-            catch (Exception ex)
-            {
-                _log.Warn($"Forward listener failed: {ex.Message}");
-                RunNetshPortProxy("delete", 80, ForwardPort);
-                return false;
-            }
+            // 4. Listeners
+            StartListener(ForwardPort80, "cschannel.anticheatexpert.com", 80);
+            StartListener(ForwardPort443, "cschannel.anticheatexpert.com", 443);
 
-            // 4. Try WinDivert sniff for dynamic port detection (best-effort)
+            // 5. WinDivert sniff (best-effort)
             TryStartWinDivert();
 
             IsRunning = true;
             _log.Info("MRPORT active");
             return true;
         });
+    }
+
+    private void StartPortProxy()
+    {
+        // Clean stale rules first
+        RunNetshPortProxy("delete", 80, ForwardPort80);
+        RunNetshPortProxy("delete", 443, ForwardPort443);
+
+        RunNetshPortProxy("add", 80, ForwardPort80);
+        RunNetshPortProxy("add", 443, ForwardPort443);
+    }
+
+    private void StartListener(int localPort, string upstreamHost, int upstreamPort)
+    {
+        try
+        {
+            var l = new TcpListener(IPAddress.Loopback, localPort);
+            l.Start();
+            _listeners.Add(l);
+            _ = AcceptLoopAsync(l, upstreamHost, upstreamPort, _cts!.Token);
+            _log.Info($"Listener 127.0.0.1:{localPort} → SOCKS5 {upstreamHost}:{upstreamPort}");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Listener :{localPort}: {ex.Message}");
+        }
+    }
+
+    private void AddHostsRedirect()
+    {
+        try
+        {
+            string line = $"127.0.0.1 {_targetDomain}";
+            if (File.ReadAllLines(HostsPath).Any(l => l.Trim() == line))
+            {
+                _log.Info("Hosts redirect already exists");
+                return;
+            }
+            File.AppendAllText(HostsPath, "\r\n" + line);
+            _log.Info($"Hosts redirect: 127.0.0.1 → {_targetDomain}");
+            FlushDns();
+        }
+        catch (Exception ex) { _log.Warn($"Hosts redirect: {ex.Message}"); }
+    }
+
+    private void RemoveHostsRedirect()
+    {
+        try
+        {
+            string line = $"127.0.0.1 {_targetDomain}";
+            var lines = File.ReadAllLines(HostsPath).Where(l => l.Trim() != line).ToList();
+            File.WriteAllLines(HostsPath, lines);
+            _log.Info("Hosts redirect removed");
+            FlushDns();
+        }
+        catch (Exception ex) { _log.Warn($"Hosts cleanup: {ex.Message}"); }
+    }
+
+    private static void FlushDns()
+    {
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo("ipconfig", "/flushdns")
+            { CreateNoWindow = true, UseShellExecute = false });
+            p?.WaitForExit(3000);
+        }
+        catch { }
     }
 
     private void TryStartWinDivert()
@@ -113,10 +169,10 @@ public class DynamicPortListener : IDisposable
             }
             if (_windivertHandle == IntPtr.Zero)
             {
-                _log.Info("WinDivert unavailable - dynamic ports won't be proxied");
+                _log.Info("WinDivert unavailable");
                 return;
             }
-            _log.Info("WinDivert sniff active for dynamic port detection");
+            _log.Info("WinDivert sniff active");
             _sniffThread = new Thread(SniffLoop) { IsBackground = true, Name = "WinDivert" };
             _sniffThread.Start();
         }
@@ -131,7 +187,6 @@ public class DynamicPortListener : IDisposable
         byte[] buf = new byte[BufSize];
         var addr = new WINDIVERT_ADDRESS();
         int recvLen = 0;
-
         while (!_cts!.IsCancellationRequested && _windivertHandle != IntPtr.Zero)
         {
             try
@@ -139,18 +194,12 @@ public class DynamicPortListener : IDisposable
                 if (!WinDivertRecv(_windivertHandle, buf, BufSize, ref addr, ref recvLen))
                 { Thread.Sleep(50); continue; }
                 if (recvLen < 40 || (buf[0] & 0xF0) != 0x40) continue;
-
                 var dstIp = new IPAddress(new[] { buf[16], buf[17], buf[18], buf[19] });
-
-                // Only care about inbound to target IPs (on loopback)
                 if (!IsTargetIp(dstIp)) continue;
-
                 int ipHdrLen = (buf[0] & 0x0F) * 4;
                 int tcpOff = ipHdrLen;
                 int dstPort = (buf[tcpOff] << 8) | buf[tcpOff + 1];
-
                 _log.Info($"WinDivert sniff: {dstIp}:{dstPort}");
-                // We don't consume or modify - just log for now
             }
             catch { }
         }
@@ -163,10 +212,9 @@ public class DynamicPortListener : IDisposable
             try
             {
                 var ip = new IPAddress(ipBytes);
-                var psi = new ProcessStartInfo("netsh",
+                using var p = Process.Start(new ProcessStartInfo("netsh",
                     $"int ip add address \"Loopback Pseudo-Interface 1\" {ip} 255.255.255.255")
-                { CreateNoWindow = true, UseShellExecute = false };
-                using var p = Process.Start(psi);
+                { CreateNoWindow = true, UseShellExecute = false });
                 p?.WaitForExit(2000);
             }
             catch { }
@@ -181,7 +229,6 @@ public class DynamicPortListener : IDisposable
             string args = action == "add"
                 ? $"interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport={fromPort} connectaddress=127.0.0.1 connectport={toPort}"
                 : $"interface portproxy delete v4tov4 listenaddress=127.0.0.1 listenport={fromPort}";
-
             var psi = new ProcessStartInfo("netsh", args)
             {
                 CreateNoWindow = true, UseShellExecute = false,
@@ -189,46 +236,45 @@ public class DynamicPortListener : IDisposable
             };
             using var p = Process.Start(psi);
             p?.WaitForExit(3000);
-            var outText = p?.StandardOutput.ReadToEnd() ?? "";
             var errText = p?.StandardError.ReadToEnd() ?? "";
             if (!string.IsNullOrEmpty(errText))
                 _log.Warn($"netsh {action} portproxy: {errText.Trim()}");
             else
-                _log.Info($"netsh {action} portproxy OK");
+                _log.Info($"netsh portproxy {action} :{fromPort}→:{toPort} OK");
         }
         catch (Exception ex) { _log.Warn($"netsh {action} portproxy: {ex.Message}"); }
     }
 
-    private async Task AcceptLoopAsync(TcpListener listener, string targetHost, int targetPort, CancellationToken ct)
+    private async Task AcceptLoopAsync(TcpListener listener, string upstreamHost, int upstreamPort, CancellationToken ct)
     {
         try
         {
             while (!ct.IsCancellationRequested)
             {
                 var client = await listener.AcceptTcpClientAsync(ct);
-                _ = RelayConnectionAsync(client, targetHost, targetPort);
+                _ = RelayConnectionAsync(client, upstreamHost, upstreamPort);
             }
         }
         catch { }
         finally { try { listener.Stop(); } catch { } }
     }
 
-    private async Task RelayConnectionAsync(TcpClient client, string targetHost, int targetPort)
+    private async Task RelayConnectionAsync(TcpClient client, string upstreamHost, int upstreamPort)
     {
         try
         {
-            _log.Info($"SOCKS5 {targetHost}:{targetPort}...");
+            _log.Info($"SOCKS5 {upstreamHost}:{upstreamPort}...");
             using var socks = _clientFactory.Create();
             await socks.ConnectAsync();
-            await socks.ConnectThroughProxyAsync(targetHost, targetPort);
-            _log.Info($"SOCKS5 CONNECT OK to {targetHost}:{targetPort}");
-
+            await socks.ConnectThroughProxyAsync(upstreamHost, upstreamPort);
+            _log.Info($"SOCKS5 CONNECT OK {upstreamHost}:{upstreamPort}");
             using var clientStream = client.GetStream();
-            var relay = new TcpRelay(clientStream, socks.GetStream(), msg => _log.Info($"{targetHost}:{targetPort}: {msg}"));
+            var relay = new TcpRelay(clientStream, socks.GetStream(),
+                msg => _log.Info($"{upstreamHost}:{upstreamPort}: {msg}"));
             int total = await relay.RunAsync(CancellationToken.None);
-            _log.Info($"SOCKS5 {targetHost}:{targetPort} done ({total}B)");
+            _log.Info($"SOCKS5 {upstreamHost}:{upstreamPort} done ({total}B)");
         }
-        catch (Exception ex) { _log.Warn($"SOCKS5 {targetHost}:{targetPort}: {ex.GetType().Name}: {ex.Message}"); }
+        catch (Exception ex) { _log.Warn($"SOCKS5 {upstreamHost}:{upstreamPort}: {ex.GetType().Name}: {ex.Message}"); }
         finally { client.Dispose(); }
     }
 
@@ -280,11 +326,17 @@ public class DynamicPortListener : IDisposable
         _sniffThread?.Join(1000);
         _sniffThread = null;
 
-        // Close listener first (so portproxy can be deleted)
-        try { _forwardListener?.Stop(); } catch { }
+        // Stop all listeners
+        foreach (var l in _listeners)
+        { try { l.Stop(); } catch { } }
+        _listeners.Clear();
 
-        // Remove portproxy (must be after listener close)
-        RunNetshPortProxy("delete", 80, ForwardPort);
+        // Remove hosts redirect
+        RemoveHostsRedirect();
+
+        // Remove portproxy
+        RunNetshPortProxy("delete", 80, ForwardPort80);
+        RunNetshPortProxy("delete", 443, ForwardPort443);
 
         // Remove loopback IPs
         foreach (var ipBytes in _targetIps)
@@ -300,26 +352,10 @@ public class DynamicPortListener : IDisposable
             catch { }
         }
 
-        // Verify cleanup
-        try
-        {
-            using var p = Process.Start(new ProcessStartInfo("netsh",
-                "interface portproxy show all")
-            {
-                CreateNoWindow = true, UseShellExecute = false,
-                RedirectStandardOutput = true
-            });
-            p?.WaitForExit(1000);
-            var show = p?.StandardOutput.ReadToEnd() ?? "";
-            if (show.Contains("127.0.0.1")) _log.Warn("Cleanup: portproxy still exists!");
-            else _log.Info("Cleanup confirmed: no portproxy rules remain");
-        }
-        catch { }
-
         _log.Info("MRPORT stopped");
     }
 
-    public void Dispose() { Stop(); _cts?.Dispose(); }
+    public void Dispose() { Stop(); _cts?.Dispose(); _windivertHandle = IntPtr.Zero; }
 
     private class BytesComparer : IEqualityComparer<byte[]>
     {
