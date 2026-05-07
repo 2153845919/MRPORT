@@ -20,7 +20,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="callout.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('callout.dll')" />
     <Content Include="WinDivert.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('WinDivert.dll')" />
     <Content Include="WinDivert64.sys" CopyToOutputDirectory="PreserveNewest" Condition="Exists('WinDivert64.sys')" />
   </ItemGroup>

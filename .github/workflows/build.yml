@@ -20,15 +20,7 @@ jobs:
       with:
         dotnet-version: '8.0.x'
 
-    - name: Build WFP Callout DLL
-      shell: pwsh
-      run: |
-        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-        $vsPath = & $vswhere -latest -property installationPath
-        $bat = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
-        & cmd.exe /c "`"$bat`" x64 2>&1 && cl /nologo /O2 /MD /TP Callout\callout.c /link /DLL /OUT:callout.dll /DEF:Callout\callout.def"
-        if (-not (Test-Path callout.dll)) { throw "callout.dll build failed" }
-        Write-Host "callout.dll OK"
+    # WFP callout DLL removed - using hosts+WinDivert sniff+local listeners instead
 
     - name: Download WinDivert
       shell: pwsh

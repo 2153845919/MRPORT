@@ -1,27 +1,20 @@
 using System;
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Linq;
-using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace MRPORT.Services;
 
-/// <summary>
-/// Main engine: WFP redirect + local proxy + SOCKS5 forward.
-/// </summary>
 public class ProxyEngine : INotifyPropertyChanged, IDisposable
 {
     private readonly ConfigManager _config;
     private readonly LogService _log;
     private readonly Socks5ClientFactory _clientFactory;
-    private readonly WfpEngine _wfp;
-    private LocalProxyServer? _proxy;
+    private const string TargetDomain = "cschannel.anticheatexpert.com";
+    private DynamicPortListener? _dynListener;
     private LatencyMonitor? _latency;
     private ProcessGuard? _guard;
-
-    public const int LocalProxyPort = 21539;
 
     private bool _isRunning;
     private int _currentLatency = -1;
@@ -59,12 +52,8 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
     {
         _config = config;
         _log = log;
-        _wfp = new WfpEngine(log);
-
         var cfg = config.Load();
-        _clientFactory = new Socks5ClientFactory(
-            cfg.ServerAddress, cfg.ServerPort, cfg.Username, cfg.Password);
-
+        _clientFactory = new Socks5ClientFactory(cfg.ServerAddress, cfg.ServerPort, cfg.Username, cfg.Password);
         if (!string.IsNullOrEmpty(cfg.LastRunTime))
             LastRunTime = cfg.LastRunTime;
     }
@@ -72,7 +61,6 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
     public async Task<bool> StartAsync()
     {
         if (IsRunning) return true;
-
         _log.Info("Starting proxy engine...");
 
         var cfg = _config.Load();
@@ -82,72 +70,46 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
             return false;
         }
 
-        // Test SOCKS5 connection
+        // Test SOCKS5
         try
         {
-            _log.Info("Testing SOCKS5 connection...");
-            using var testClient = _clientFactory.Create();
-            await testClient.ConnectAsync();
-            _log.Info("SOCKS5 connection OK");
+            using var test = _clientFactory.Create();
+            await test.ConnectAsync();
+            _log.Info("SOCKS5 OK");
         }
         catch (Exception ex)
         {
-            _log.Error($"SOCKS5 connection failed: {ex.Message}");
+            _log.Error($"SOCKS5: {ex.Message}");
             return false;
         }
 
-        // Initialize WFP callout engine
-        if (!_wfp.InitializeEngine())
-        {
-            _log.Error("WFP callout engine init failed (callout.dll missing?)");
-            return false;
-        }
+        // Dynamic port listener (hosts file + WinDivert sniff + known port listeners)
+        _dynListener = new DynamicPortListener(_clientFactory, _log, TargetDomain);
+        _dynListener.Start();
 
-        // Set target IPs (DNS + loopback 127.0.0.1)
-        try
-        {
-            var entry = await Dns.GetHostEntryAsync("cschannel.anticheatexpert.com");
-            var ips = entry.AddressList.Where(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).ToList();
-            ips.Add(IPAddress.Loopback); // For 127.0.0.1:80
-            _wfp.SetTargetIps(ips.ToArray());
-            _log.Info($"WFP targets set: {string.Join(", ", ips.Select(a => a))}");
-        }
-        catch (Exception ex)
-        {
-            _log.Error($"DNS resolve failed: {ex.Message}");
-            return false;
-        }
-
-        // Start local proxy
-        _proxy = new LocalProxyServer(LocalProxyPort, _clientFactory, _wfp, _log);
-        _proxy.Start();
-        _log.Info($"Local proxy started on 127.0.0.1:{LocalProxyPort}");
-
-        // Start latency monitor
+        // Latency
         _latency = new LatencyMonitor(cfg.ServerAddress, cfg.ServerPort);
         _latency.OnLatencyUpdated += OnLatencyUpdated;
         _latency.Start();
 
-        // Run time tracking
+        // Runtime tracker
         _runStart = DateTime.Now;
         _ = RunTimeTrackerAsync();
 
         // Process guard
         _guard = new ProcessGuard("MRPORT");
         _guard.StartGuard();
-        _log.Info("Process guard started");
 
         IsRunning = true;
-        _log.Info("MRPORT started successfully");
+        _log.Info("MRPORT started");
         return true;
     }
 
     public void Stop()
     {
         if (!IsRunning) return;
-
-        _log.Info("Stopping proxy engine...");
-        _proxy?.Stop();
+        _log.Info("Stopping...");
+        _dynListener?.Stop();
         _latency?.Stop();
         _guard?.Dispose();
 
@@ -155,7 +117,6 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
         cfg.LastRunTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
         LastRunTime = cfg.LastRunTime;
         _config.Save(cfg);
-
         IsRunning = false;
         _log.Info("MRPORT stopped");
     }
@@ -169,10 +130,11 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
         _log.Info("Credentials saved");
     }
 
-    private void OnLatencyUpdated(int latencyMs)
+    private int _failedChecks;
+    private void OnLatencyUpdated(int ms)
     {
-        CurrentLatency = latencyMs;
-        if (latencyMs < 0)
+        CurrentLatency = ms;
+        if (ms < 0)
         {
             _failedChecks++;
             if (_failedChecks >= 3)
@@ -181,45 +143,32 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
                 ProcessGuard.KillNrcLauncher();
             }
         }
-        else
-        {
-            _failedChecks = 0;
-        }
+        else _failedChecks = 0;
     }
-
-    private int _failedChecks;
 
     private async Task RunTimeTrackerAsync()
     {
         while (IsRunning)
         {
-            var elapsed = DateTime.Now - _runStart;
-            RunTimeStr = $"{(int)elapsed.TotalHours:D2}:{elapsed.Minutes:D2}:{elapsed.Seconds:D2}";
+            var e = DateTime.Now - _runStart;
+            RunTimeStr = $"{(int)e.TotalHours:D2}:{e.Minutes:D2}:{e.Seconds:D2}";
             try { await Task.Delay(1000); } catch { break; }
         }
     }
 
     public void VerifyWebsite()
     {
-        try
-        {
-            Process.Start(new ProcessStartInfo("http://127.0.0.1:80") { UseShellExecute = true });
-        }
-        catch (Exception ex)
-        {
-            _log.Error($"Failed to open browser: {ex.Message}");
-        }
+        try { Process.Start(new ProcessStartInfo("http://127.0.0.1:80") { UseShellExecute = true }); }
+        catch (Exception ex) { _log.Error($"Browser: {ex.Message}"); }
     }
 
-    protected void OnPropertyChanged(string name) =>
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    private void OnPropertyChanged(string n) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(n));
 
     public void Dispose()
     {
         Stop();
-        _proxy?.Dispose();
+        _dynListener?.Dispose();
         _latency?.Dispose();
         _guard?.Dispose();
-        _wfp.Dispose();
     }
 }
