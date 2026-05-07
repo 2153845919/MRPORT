@@ -4,8 +4,10 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'MRPORT/**'
-      - '.github/workflows/mrport-build.yml'
+      - '**.cs'
+      - '**.xaml'
+      - '**.csproj'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 jobs:
@@ -27,14 +29,14 @@ jobs:
         $url = "https://github.com/basil00/WinDivert/releases/download/v$version/WinDivert-$version-x64.zip"
         Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\windivert.zip"
         Expand-Archive -Path "$env:TEMP\windivert.zip" -DestinationPath "$env:TEMP\windivert-extract" -Force
-        New-Item -ItemType Directory -Force -Path MRPORT/WinDivert
-        Copy-Item "$env:TEMP\windivert-extract\x64\WinDivert64.sys" -Destination MRPORT/WinDivert/
-        Copy-Item "$env:TEMP\windivert-extract\x64\WinDivert.dll" -Destination MRPORT/WinDivert/
+        New-Item -ItemType Directory -Force -Path WinDivert
+        Copy-Item "$env:TEMP\windivert-extract\x64\WinDivert64.sys" -Destination WinDivert/
+        Copy-Item "$env:TEMP\windivert-extract\x64\WinDivert.dll" -Destination WinDivert/
 
     - name: Build
       shell: pwsh
       run: |
-        dotnet publish MRPORT/MRPORT.csproj -c Release -o out `
+        dotnet publish MRPORT.csproj -c Release -o out `
           --runtime win-x64 `
           --self-contained false
 
