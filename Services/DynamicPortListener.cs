@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -88,6 +89,9 @@ public class DynamicPortListener : IDisposable
             // Resolve real IPs (no hosts file modification!)
             if (!ResolveTargetIps()) return false;
 
+            // Copy WinDivert files to TEMP so user can delete app folder freely
+            CopyToTempIfNeeded();
+
             // Open WinDivert: capture ALL outbound TCP SYNs (including loopback)
             string filter = "outbound and tcp.Syn and not tcp.Ack";
             // Negative priority to capture loopback traffic too
@@ -130,6 +134,25 @@ public class DynamicPortListener : IDisposable
             return _targetIps.Length > 0;
         }
         catch (Exception ex) { _log.Error($"DNS: {ex.Message}"); return false; }
+    }
+
+    private static void CopyToTempIfNeeded()
+    {
+        string localDir = AppDomain.CurrentDomain.BaseDirectory;
+        string tempDir = Path.Combine(Path.GetTempPath(), "MRPORT");
+        Directory.CreateDirectory(tempDir);
+
+        string[] files = ["WinDivert64.sys", "WinDivert.dll"];
+        foreach (var f in files)
+        {
+            string src = Path.Combine(localDir, f);
+            string dst = Path.Combine(tempDir, f);
+            if (File.Exists(src) && (!File.Exists(dst) || File.GetLastWriteTimeUtc(src) > File.GetLastWriteTimeUtc(dst)))
+                File.Copy(src, dst, true);
+        }
+
+        // Change working directory so WinDivert loads from TEMP
+        Environment.CurrentDirectory = tempDir;
     }
 
     private void SniffLoop()
