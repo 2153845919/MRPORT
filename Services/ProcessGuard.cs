@@ -14,8 +14,6 @@ public class ProcessGuard : IDisposable
     private readonly string _mainProcessName;
     private CancellationTokenSource? _cts;
     private Task? _watchdog;
-    private bool _isGuardMode;
-
     public event Action? OnGuardRestart;
 
     /// <summary>
@@ -28,7 +26,6 @@ public class ProcessGuard : IDisposable
 
     public void StartGuard()
     {
-        _isGuardMode = true;
         _cts = new CancellationTokenSource();
         _watchdog = Task.Run(() => GuardLoopAsync(_cts.Token));
     }

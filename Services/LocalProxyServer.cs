@@ -58,7 +58,7 @@ public class LocalProxyServer : IDisposable
 
         try
         {
-            using var socks = _clientFactory();
+            using var socks = _clientFactory.Create();
             await socks.ConnectAsync(ct);
             await socks.ConnectThroughProxyAsync(origDst.Host, origDst.Port, ct);
 

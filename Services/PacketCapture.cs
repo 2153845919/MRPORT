@@ -114,7 +114,6 @@ public class PacketCapture : IDisposable
     private IntPtr _handle;
     private CancellationTokenSource? _cts;
     private Task? _captureTask;
-    private Task? _dnsTask;
     private byte[][] _targetIps = [];
 
     public bool IsRunning { get; private set; }
@@ -232,7 +231,7 @@ public class PacketCapture : IDisposable
                     ip.DstAddr = BitConverter.ToUInt32(new byte[] { 127, 0, 0, 1 }, 0);
                     Marshal.StructureToPtr(ip, ipHdr, false);
 
-                    tcp.DstPort = IPAddress.HostToNetworkOrder((short)_localProxyPort);
+                    tcp.DstPort = (ushort)IPAddress.HostToNetworkOrder((short)_localProxyPort);
                     Marshal.StructureToPtr(tcp, tcpHdr, false);
 
                     // Recalculate checksums
