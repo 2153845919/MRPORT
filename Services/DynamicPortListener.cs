@@ -138,7 +138,7 @@ public class DynamicPortListener : IDisposable
         var addr = new WINDIVERT_ADDRESS();
         int recvLen = 0;
 
-        while (!_cts!.IsCancellationRequested)
+        while (!_cts!.IsCancellationRequested && _handle != IntPtr.Zero)
         {
             try
             {
@@ -276,22 +276,21 @@ public class DynamicPortListener : IDisposable
         IsRunning = false;
         _cts?.Cancel();
 
-        // Shutdown everything on bg thread (WinDivertClose may block)
+        // Close WinDivert handle — immediately unblocks pending WinDivertRecv
         var h = _handle;
         _handle = IntPtr.Zero;
-        var t = _sniffThread;
+        if (h != IntPtr.Zero) WinDivertClose(h); // fast: signals the handle, recv returns FALSE
+
+        // Join sniff thread (should exit quickly after WinDivertClose)
+        _sniffThread?.Join(2000);
         _sniffThread = null;
 
-        Task.Run(() =>
-        {
-            if (h != IntPtr.Zero) WinDivertClose(h); // unblocks sniff thread
-            t?.Join(1000);
-            try { _loopbackFallbackListener?.Stop(); } catch { }
-            foreach (var (_, l) in _listeners) { try { l.Stop(); } catch { } }
-            _listeners.Clear();
-        });
+        // Close all listeners
+        try { _loopbackFallbackListener?.Stop(); } catch { }
+        foreach (var (_, l) in _listeners) { try { l.Stop(); } catch { } }
+        _listeners.Clear();
 
-        _log.Info("MRPORT stopping...");
+        _log.Info("MRPORT stopped");
     }
 
     public void Dispose() { Stop(); _cts?.Dispose(); }
