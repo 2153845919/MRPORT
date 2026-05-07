@@ -90,7 +90,8 @@ public class DynamicPortListener : IDisposable
 
             // Open WinDivert: capture ALL outbound TCP SYNs (including loopback)
             string filter = "outbound and tcp.Syn and not tcp.Ack";
-            _handle = WinDivertOpen(filter, 0, (short)1, 0);
+            // Negative priority to capture loopback traffic too
+            _handle = WinDivertOpen(filter, 0, (short)-100, 0);
             if (_handle == IntPtr.Zero) { _log.Error("WinDivertOpen failed"); return false; }
             _log.Info("WinDivert SYN redirect started");
 
@@ -274,21 +275,23 @@ public class DynamicPortListener : IDisposable
         if (!IsRunning) return;
         IsRunning = false;
         _cts?.Cancel();
+
+        // Shutdown everything on bg thread (WinDivertClose may block)
+        var h = _handle;
+        _handle = IntPtr.Zero;
+        var t = _sniffThread;
         _sniffThread = null;
 
         Task.Run(() =>
         {
+            if (h != IntPtr.Zero) WinDivertClose(h); // unblocks sniff thread
+            t?.Join(1000);
             try { _loopbackFallbackListener?.Stop(); } catch { }
             foreach (var (_, l) in _listeners) { try { l.Stop(); } catch { } }
             _listeners.Clear();
         });
 
-        var h = _handle;
-        _handle = IntPtr.Zero;
-        if (h != IntPtr.Zero)
-            Task.Run(() => WinDivertClose(h));
-
-        _log.Info("MRPORT stopped");
+        _log.Info("MRPORT stopping...");
     }
 
     public void Dispose() { Stop(); _cts?.Dispose(); }
