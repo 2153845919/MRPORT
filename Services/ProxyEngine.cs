@@ -1,20 +1,23 @@
 using System;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Linq;
+using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace MRPORT.Services;
 
 /// <summary>
-/// Main engine that orchestrates all proxy components.
+/// Main engine: WFP redirect + local proxy + SOCKS5 forward.
 /// </summary>
 public class ProxyEngine : INotifyPropertyChanged, IDisposable
 {
     private readonly ConfigManager _config;
     private readonly LogService _log;
     private readonly Socks5ClientFactory _clientFactory;
-    private PacketCapture? _capture;
+    private readonly WfpEngine _wfp;
+    private LocalProxyServer? _proxy;
     private LatencyMonitor? _latency;
     private ProcessGuard? _guard;
 
@@ -56,6 +59,7 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
     {
         _config = config;
         _log = log;
+        _wfp = new WfpEngine(log);
 
         var cfg = config.Load();
         _clientFactory = new Socks5ClientFactory(
@@ -71,7 +75,6 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
 
         _log.Info("Starting proxy engine...");
 
-        // Validate credentials
         var cfg = _config.Load();
         if (string.IsNullOrEmpty(cfg.Username) || string.IsNullOrEmpty(cfg.Password))
         {
@@ -93,22 +96,43 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
             return false;
         }
 
-        // Start packet capture (TCP MITM transparent proxy via WinDivert)
-        _capture = new PacketCapture(_clientFactory, _log);
-        _capture.Start();
-        _log.Info("Packet capture (TCP transparent proxy) started");
+        // Initialize WFP callout engine
+        if (!_wfp.InitializeEngine())
+        {
+            _log.Error("WFP callout engine init failed (callout.dll missing?)");
+            return false;
+        }
 
-        // Start latency monitor (direct TCP to SOCKS5 server)
+        // Set target IPs (DNS + loopback 127.0.0.1)
+        try
+        {
+            var entry = await Dns.GetHostEntryAsync("cschannel.anticheatexpert.com");
+            var ips = entry.AddressList.Where(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).ToList();
+            ips.Add(IPAddress.Loopback); // For 127.0.0.1:80
+            _wfp.SetTargetIps(ips.ToArray());
+            _log.Info($"WFP targets set: {string.Join(", ", ips.Select(a => a))}");
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"DNS resolve failed: {ex.Message}");
+            return false;
+        }
+
+        // Start local proxy
+        _proxy = new LocalProxyServer(LocalProxyPort, _clientFactory, _wfp, _log);
+        _proxy.Start();
+        _log.Info($"Local proxy started on 127.0.0.1:{LocalProxyPort}");
+
+        // Start latency monitor
         _latency = new LatencyMonitor(cfg.ServerAddress, cfg.ServerPort);
         _latency.OnLatencyUpdated += OnLatencyUpdated;
         _latency.Start();
-        _log.Info("Latency monitor started");
 
-        // Start run time tracking
+        // Run time tracking
         _runStart = DateTime.Now;
         _ = RunTimeTrackerAsync();
 
-        // Start process guard
+        // Process guard
         _guard = new ProcessGuard("MRPORT");
         _guard.StartGuard();
         _log.Info("Process guard started");
@@ -123,12 +147,10 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
         if (!IsRunning) return;
 
         _log.Info("Stopping proxy engine...");
-
-        _capture?.Stop();
+        _proxy?.Stop();
         _latency?.Stop();
         _guard?.Dispose();
 
-        // Save last run time
         var cfg = _config.Load();
         cfg.LastRunTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
         LastRunTime = cfg.LastRunTime;
@@ -150,8 +172,6 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
     private void OnLatencyUpdated(int latencyMs)
     {
         CurrentLatency = latencyMs;
-
-        // If 3 consecutive failures, kill nrc_launcher
         if (latencyMs < 0)
         {
             _failedChecks++;
@@ -197,8 +217,9 @@ public class ProxyEngine : INotifyPropertyChanged, IDisposable
     public void Dispose()
     {
         Stop();
-        _capture?.Dispose();
+        _proxy?.Dispose();
         _latency?.Dispose();
         _guard?.Dispose();
+        _wfp.Dispose();
     }
 }

@@ -3,11 +3,9 @@ name: Build MRPORT
 on:
   push:
     branches: [ main ]
-    paths:
-      - '**.cs'
-      - '**.xaml'
-      - '**.csproj'
-      - '.github/workflows/build.yml'
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
   workflow_dispatch:
 
 jobs:
@@ -22,6 +20,18 @@ jobs:
       with:
         dotnet-version: '8.0.x'
 
+    - name: Build WFP Callout DLL
+      shell: pwsh
+      run: |
+        # Find VS installation
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vsPath = & $vswhere -latest -property installationPath
+        $bat = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+        $env:VSCMD_ARG_TGT_ARCH = "x64"
+        cmd.exe /c "`"$bat`" x64 >nul 2>&1 && cl /nologo /O2 /MD Callout\callout.c /link /DLL /OUT:callout.dll /DEF:Callout\callout.def"
+        if (-not (Test-Path "callout.dll")) { throw "callout.dll build failed" }
+        Write-Host "callout.dll built successfully"
+
     - name: Download WinDivert
       shell: pwsh
       run: |
@@ -31,16 +41,13 @@ jobs:
         Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\windivert.zip"
         Expand-Archive -Path "$env:TEMP\windivert.zip" -DestinationPath "$env:TEMP\windivert-extract" -Force
         $extracted = Get-ChildItem "$env:TEMP\windivert-extract" -Directory | Select-Object -First 1
-        New-Item -ItemType Directory -Force -Path WinDivert
-        Copy-Item "$($extracted.FullName)\x64\WinDivert64.sys" -Destination WinDivert/
-        Copy-Item "$($extracted.FullName)\x64\WinDivert.dll" -Destination WinDivert/
+        Copy-Item "$($extracted.FullName)\x64\WinDivert64.sys" -Destination WinDivert64.sys
+        Copy-Item "$($extracted.FullName)\x64\WinDivert.dll" -Destination WinDivert.dll
 
-    - name: Build
+    - name: Build C#
       shell: pwsh
       run: |
-        dotnet publish MRPORT.csproj -c Release -o out `
-          --runtime win-x64 `
-          --self-contained false
+        dotnet publish MRPORT.csproj -c Release -o out --runtime win-x64 --self-contained false
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4

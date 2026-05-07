@@ -1,0 +1,8 @@
+// callout.def - Export definitions for WFP callout DLL
+EXPORTS
+    Initialize
+    Shutdown
+    SetTargets
+    GetTargetCount
+    AddFilter
+    ReadOrigDst
