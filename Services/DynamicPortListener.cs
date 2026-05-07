@@ -79,7 +79,7 @@ public class DynamicPortListener : IDisposable
             // 3. Listener on 0.0.0.0:21539 accepts redirected :80 traffic
             try
             {
-                _forwardListener = new TcpListener(IPAddress.Loopback, ForwardPort);
+                _forwardListener = new TcpListener(IPAddress.Any, ForwardPort);
                 _forwardListener.Start();
                 _ = AcceptLoopAsync(_forwardListener, 80, _cts.Token);
                 _log.Info($"Forward listener on 0.0.0.0:{ForwardPort}");
@@ -221,13 +221,14 @@ public class DynamicPortListener : IDisposable
             using var socks = _clientFactory.Create();
             await socks.ConnectAsync();
             await socks.ConnectThroughProxyAsync(_targetDomain, port);
+            _log.Info($"SOCKS5 CONNECT OK to {_targetDomain}:{port}");
 
             using var clientStream = client.GetStream();
-            var relay = new TcpRelay(clientStream, socks.GetStream());
-            await relay.RunAsync(CancellationToken.None);
-            _log.Info($"Relay done port {port}");
+            var relay = new TcpRelay(clientStream, socks.GetStream(), msg => _log.Info($"Relay {port}: {msg}"));
+            int total = await relay.RunAsync(CancellationToken.None);
+            _log.Info($"Relay done port {port} ({total}B)");
         }
-        catch (Exception ex) { _log.Warn($"Relay port {port}: {ex.Message}"); }
+        catch (Exception ex) { _log.Warn($"Relay port {port}: {ex.GetType().Name}: {ex.Message}"); }
         finally { client.Dispose(); }
     }
 
@@ -331,19 +332,27 @@ public class DynamicPortListener : IDisposable
 public class TcpRelay
 {
     private readonly NetworkStream _a, _b;
-    public TcpRelay(NetworkStream a, NetworkStream b) { _a = a; _b = b; }
+    private readonly Action<string>? _log;
+    private int _relayedBytes;
 
-    public async Task RunAsync(CancellationToken ct)
+    public TcpRelay(NetworkStream a, NetworkStream b, Action<string>? log = null)
+    {
+        _a = a; _b = b; _log = log;
+    }
+
+    public async Task<int> RunAsync(CancellationToken ct)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var t1 = CopyAsync(_a, _b, cts.Token);
-        var t2 = CopyAsync(_b, _a, cts.Token);
+        var t1 = CopyAsync(_a, _b, "A→B", cts.Token);
+        var t2 = CopyAsync(_b, _a, "B→A", cts.Token);
         await Task.WhenAny(t1, t2);
         cts.Cancel();
         try { await Task.WhenAll(t1, t2); } catch { }
+        _log?.Invoke($"Relay end: {_relayedBytes}B total");
+        return _relayedBytes;
     }
 
-    private static async Task CopyAsync(NetworkStream src, NetworkStream dst, CancellationToken ct)
+    private async Task CopyAsync(NetworkStream src, NetworkStream dst, string dir, CancellationToken ct)
     {
         byte[] buf = new byte[81920];
         try
@@ -351,10 +360,13 @@ public class TcpRelay
             while (!ct.IsCancellationRequested)
             {
                 var r = await src.ReadAsync(buf, ct);
-                if (r == 0) break;
+                if (r == 0) { _log?.Invoke($"{dir}: remote closed"); break; }
+                Interlocked.Add(ref _relayedBytes, r);
                 await dst.WriteAsync(buf.AsMemory(0, r), ct);
+                _log?.Invoke($"{dir}: {r}B relayed");
             }
         }
-        catch { }
+        catch (OperationCanceledException) { _log?.Invoke($"{dir}: cancelled"); }
+        catch (Exception ex) { _log?.Invoke($"{dir}: {ex.GetType().Name} {ex.Message}"); }
     }
 }
