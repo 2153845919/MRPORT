@@ -1,17 +1,12 @@
 // callout.c - WFP ALE_CONNECT_REDIRECT user-mode callout DLL
-// Redirects target TCP connections to local SOCKS5 forwarder
+// Compiled as C++ (/TP) for MSVC compatibility
 
-#pragma comment(lib, "fwpuclnt")
-#pragma comment(lib, "ws2_32")
-#pragma comment(lib, "advapi32")
-
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <fwpmu.h>
-#include <mstcpip.h>
 #include <winsock2.h>
 #include <ws2ipdef.h>
+#include <fwpmu.h>
 
-// GUIDs
 // {C9A8F1E0-4B1A-4A9D-8C1A-2F0E9D84B1A9}
 const GUID CALLOUT_GUID = {
     0xc9a8f1e0, 0x4b1a, 0x4a9d, {0x8c, 0x1a, 0x2f, 0x0e, 0x9d, 0x84, 0xb1, 0xa9}
@@ -30,7 +25,6 @@ static HANDLE g_engine = NULL;
 static HANDLE g_shmOrig = NULL, g_shmTargets = NULL;
 static BYTE* g_origView = NULL, *g_targetView = NULL;
 
-// FWPS_CONNECT_REQUEST0 - user-mode version (from Windows SDK)
 typedef struct _MRPORT_CONNECT_REQUEST {
     SOCKADDR* localAddress;
     SOCKADDR* remoteAddress;
@@ -45,8 +39,7 @@ static BOOL IsTargetIp(ULONG ip) {
     if (!g_targetView) return FALSE;
     LONG count;
     memcpy(&count, g_targetView, 4);
-    if (count < 0) count = 0;
-    if (count > MAX_TARGETS) count = MAX_TARGETS;
+    if (count < 0 || count > MAX_TARGETS) count = 0;
     for (LONG i = 0; i < count; i++) {
         ULONG target;
         memcpy(&target, g_targetView + 4 + i * 4, 4);
@@ -88,18 +81,16 @@ void NTAPI ClassifyFn(
     USHORT port = remote->sin_port;
     USHORT localPort = req->localPort;
 
-    // Check 127.0.0.1:80 (always proxy)
+    // 127.0.0.1:80 - always proxy (let local listener handle)
     if (ip == htonl(0x0100007F) && ntohs(port) == 80) {
-        ULONG fakeOrig = htonl(0x0100007F); // 127.0.0.1
-        StoreOrigDst(localPort, fakeOrig, port);
-        return; // Let it connect to 127.0.0.1:80 normally; local listener handles it
+        StoreOrigDst(localPort, ip, port);
+        return;
     }
 
-    // Check target IPs
+    // Match target IPs - redirect to local proxy
     if (IsTargetIp(ip)) {
         StoreOrigDst(localPort, ip, port);
-        // Redirect to local proxy
-        remote->sin_addr.S_un.S_addr = htonl(0x0100007F); // 127.0.0.1
+        remote->sin_addr.S_un.S_addr = htonl(0x0100007F);
         remote->sin_port = htons(21539);
         remote->sin_family = AF_INET;
     }
@@ -110,96 +101,85 @@ NTSTATUS NTAPI NotifyFn(FWPS_CALLOUT_NOTIFY_TYPE type, const GUID* key, FWPS_FIL
 }
 
 static BOOL CreateSharedMemory() {
-    g_shmOrig = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, SHM_SIZE, SHM_ORIG_NAME);
+    g_shmOrig = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+        0, SHM_SIZE, SHM_ORIG_NAME);
     if (!g_shmOrig) return FALSE;
     g_origView = (BYTE*)MapViewOfFile(g_shmOrig, FILE_MAP_ALL_ACCESS, 0, 0, SHM_SIZE);
     if (!g_origView) return FALSE;
-    memset(g_origView, 0, SHM_SIZE);
+    ZeroMemory(g_origView, SHM_SIZE);
 
-    g_shmTargets = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 256, SHM_TARGET_NAME);
+    g_shmTargets = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+        0, 256, SHM_TARGET_NAME);
     if (!g_shmTargets) return FALSE;
     g_targetView = (BYTE*)MapViewOfFile(g_shmTargets, FILE_MAP_ALL_ACCESS, 0, 0, 256);
     if (!g_targetView) return FALSE;
-    memset(g_targetView, 0, 256);
+    ZeroMemory(g_targetView, 256);
     return TRUE;
 }
 
 __declspec(dllexport) BOOL WINAPI Initialize() {
     if (!CreateSharedMemory()) return FALSE;
 
+    FWPM_SESSION session;
+    ZeroMemory(&session, sizeof(session));
+    session.flags = FWPM_SESSION_FLAG_DYNAMIC;
+
     HANDLE engine = NULL;
-    FWPM_SESSION session = { .flags = FWPM_SESSION_FLAG_DYNAMIC };
     if (FwpmEngineOpen(NULL, RPC_C_AUTHN_WINNT, NULL, &session, &engine)) {
         return FALSE;
     }
     g_engine = engine;
 
     // Register callout
-    FWPM_CALLOUT callout = {
-        .calloutKey = CALLOUT_GUID,
-        .displayData = { .name = L"MRPORT Redirect", .description = L"Redirect to proxy" },
-        .applicableLayer = FWPM_LAYER_ALE_CONNECT_REDIRECT_V4,
-        .flags = 0
-    };
-    if (FwpmCalloutAdd(engine, &callout, NULL, NULL)) {
-        // Already exists - OK
-    }
+    FWPM_CALLOUT callout;
+    ZeroMemory(&callout, sizeof(callout));
+    callout.calloutKey = CALLOUT_GUID;
+    callout.displayData.name = L"MRPORT Redirect";
+    callout.displayData.description = L"Redirect matching connections to local proxy";
+    callout.applicableLayer = FWPM_LAYER_ALE_CONNECT_REDIRECT_V4;
+
+    NTSTATUS result = FwpmCalloutAdd(engine, &callout, NULL, NULL);
+    // Ignore FWP_E_ALREADY_EXISTS
 
     // Add sublayer
-    FWPM_SUBLAYER sublayer = {
-        .subLayerKey = SUBLAYER_GUID,
-        .displayData = { .name = L"MRPORT Sublayer", .description = L"" },
-        .weight = 0x100
-    };
+    FWPM_SUBLAYER sublayer;
+    ZeroMemory(&sublayer, sizeof(sublayer));
+    sublayer.subLayerKey = SUBLAYER_GUID;
+    sublayer.displayData.name = L"MRPORT";
+    sublayer.displayData.description = L"MRPORT proxy sublayer";
+    sublayer.weight = 0x100;
     FwpmSubLayerAdd(engine, &sublayer, NULL);
 
     return TRUE;
 }
 
-__declspec(dllexport) BOOL WINAPI AddFilter(ULONG targetIp, USHORT port) {
+__declspec(dllexport) BOOL WINAPI AddTargetFilter(ULONG targetIp) {
     if (!g_engine) return FALSE;
 
-    FWPM_FILTER filter = {
-        .subLayerKey = SUBLAYER_GUID,
-        .layerKey = FWPM_LAYER_ALE_CONNECT_REDIRECT_V4,
-        .displayData = { .name = L"MRPORT Filter", .description = L"" },
-        .action = { .type = FWP_ACTION_CALLOUT_TERMINATING, .calloutKey = CALLOUT_GUID },
-        .numFilterConditions = 2
-    };
+    FWPM_FILTER filter;
+    ZeroMemory(&filter, sizeof(filter));
+    filter.subLayerKey = SUBLAYER_GUID;
+    filter.layerKey = FWPM_LAYER_ALE_CONNECT_REDIRECT_V4;
+    filter.displayData.name = L"MRPORT rule";
+    filter.displayData.description = L"";
+    filter.action.type = FWP_ACTION_CALLOUT_TERMINATING;
+    filter.action.calloutKey = CALLOUT_GUID;
+    filter.numFilterConditions = 2;
 
-    FWPM_FILTER_CONDITION conds[2] = {
-        { .fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS,
-          .matchType = FWP_MATCH_EQUAL,
-          .conditionValue = { .type = FWP_UINT32, .uint32 = targetIp } },
-        { .fieldKey = FWPM_CONDITION_IP_PROTOCOL,
-          .matchType = FWP_MATCH_EQUAL,
-          .conditionValue = { .type = FWP_UINT8, .uint8 = IPPROTO_TCP } }
-    };
+    FWPM_FILTER_CONDITION conds[2];
+    ZeroMemory(conds, sizeof(conds));
+    conds[0].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+    conds[0].matchType = FWP_MATCH_EQUAL;
+    conds[0].conditionValue.type = FWP_UINT32;
+    conds[0].conditionValue.uint32 = targetIp;
 
-    int numConds = 2;
-    FWPM_FILTER_CONDITION conds3[3];
-    if (port != 0) {
-        memcpy(conds3, conds, sizeof(conds));
-        conds3[2] = (FWPM_FILTER_CONDITION){
-            .fieldKey = FWPM_CONDITION_IP_REMOTE_PORT,
-            .matchType = FWP_MATCH_EQUAL,
-            .conditionValue = { .type = FWP_UINT16, .uint16 = htons(port) }
-        };
-        numConds = 3;
-        filter.filterCondition = conds3;
-    } else {
-        filter.filterCondition = conds;
-    }
+    conds[1].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+    conds[1].matchType = FWP_MATCH_EQUAL;
+    conds[1].conditionValue.type = FWP_UINT8;
+    conds[1].conditionValue.uint8 = IPPROTO_TCP;
 
-    filter.numFilterConditions = numConds;
+    filter.filterCondition = conds;
     return FwpmFilterAdd(g_engine, &filter, NULL, NULL) == 0;
-}
-
-__declspec(dllexport) ULONG WINAPI GetTargetCount() {
-    if (!g_targetView) return 0;
-    ULONG count;
-    memcpy(&count, g_targetView, 4);
-    return count;
 }
 
 __declspec(dllexport) BOOL WINAPI SetTargets(ULONG* ips, ULONG count) {
@@ -228,8 +208,7 @@ __declspec(dllexport) BOOL WINAPI ReadOrigDst(USHORT localPort, ULONG* outIp, US
 }
 
 __declspec(dllexport) void WINAPI Shutdown() {
-    if (g_engine) FwpmEngineClose(g_engine);
-    g_engine = NULL;
+    if (g_engine) { FwpmEngineClose(g_engine); g_engine = NULL; }
     if (g_targetView) { UnmapViewOfFile(g_targetView); g_targetView = NULL; }
     if (g_shmTargets) { CloseHandle(g_shmTargets); g_shmTargets = NULL; }
     if (g_origView) { UnmapViewOfFile(g_origView); g_origView = NULL; }

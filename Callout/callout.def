@@ -4,5 +4,5 @@ EXPORTS
     Shutdown
     SetTargets
     GetTargetCount
-    AddFilter
+    AddTargetFilter
     ReadOrigDst
