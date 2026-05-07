@@ -165,7 +165,7 @@ public class DynamicPortListener : IDisposable
                     {
                         // Redirect 127.0.0.1:80 → 127.0.0.1:21539
                         buf[tcpOff] = (byte)(LoopbackFallbackPort >> 8);
-                        buf[tcpOff + 1] = (byte)LoopbackFallbackPort;
+                        buf[tcpOff + 1] = (byte)(LoopbackFallbackPort & 0xFF);
 
                         WinDivertHelperCalcChecksums(buf, recvLen, ref addr, 0);
                         WinDivertSend(_handle, buf, recvLen, ref addr, ref recvLen);
