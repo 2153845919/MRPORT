@@ -46,7 +46,8 @@ public partial class MainWindow : Window
 
     private void OnLogChanged(object? sender, PropertyChangedEventArgs e)
     {
-        Dispatcher.Invoke(() =>
+        // Use BeginInvoke to avoid deadlock when PropertyChanged fires from any thread
+        Dispatcher.BeginInvoke(() =>
         {
             LogBox.Text = _log.LogText;
             LogBox.ScrollToEnd();
@@ -55,7 +56,7 @@ public partial class MainWindow : Window
 
     private void OnEnginePropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        Dispatcher.Invoke(() =>
+        Dispatcher.BeginInvoke(() =>
         {
             switch (e.PropertyName)
             {

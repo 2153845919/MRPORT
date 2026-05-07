@@ -11,10 +11,6 @@ using System.Threading.Tasks;
 
 namespace MRPORT.Services;
 
-/// <summary>
-/// Hosts redirect + port sniffing (WinDivert) + local listeners → SOCKS5.
-/// Known ports get immediate listeners; unknown ports get one on SYN sniff.
-/// </summary>
 public class DynamicPortListener : IDisposable
 {
     [DllImport("WinDivert.dll", CallingConvention = CallingConvention.Cdecl)]
@@ -24,11 +20,6 @@ public class DynamicPortListener : IDisposable
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool WinDivertRecv(IntPtr handle, byte[] pPacket, int packetLen,
         ref WINDIVERT_ADDRESS pAddr, ref int pRecvLen);
-
-    [DllImport("WinDivert.dll", CallingConvention = CallingConvention.Cdecl)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool WinDivertSend(IntPtr handle, byte[] pPacket, int packetLen,
-        ref WINDIVERT_ADDRESS pAddr, ref int pSendLen);
 
     [DllImport("WinDivert.dll", CallingConvention = CallingConvention.Cdecl)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -46,12 +37,6 @@ public class DynamicPortListener : IDisposable
     [StructLayout(LayoutKind.Sequential)]
     private struct WINDIVERT_ADDRESS { public int IfIdx; public int SubIfIdx; public byte Direction; public byte R1; public byte R2; public byte R3; }
 
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    private struct IPHDR { public byte VerLen; public byte Tos; public ushort Length; public ushort Id; public ushort FragOff0; public byte Ttl; public byte Protocol; public ushort Checksum; public uint SrcAddr; public uint DstAddr; }
-
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    private struct TCPHDR { public ushort SrcPort; public ushort DstPort; public uint SeqNum; public uint AckNum; public ushort FlagsAndOffset; public ushort Window; public ushort Checksum; public ushort UrgPtr; }
-
     private const int BufSize = 0xFFFF;
     private static readonly int[] KnownPorts = [80, 443, 10012, 8080, 8443];
 
@@ -62,6 +47,7 @@ public class DynamicPortListener : IDisposable
     private CancellationTokenSource? _cts;
     private volatile byte[][] _targetIps = [];
     private readonly ConcurrentDictionary<int, TcpListener> _listeners = new();
+    private Thread? _sniffThread;
 
     public bool IsRunning { get; private set; }
 
@@ -72,7 +58,6 @@ public class DynamicPortListener : IDisposable
         _targetDomain = targetDomain;
     }
 
-    /// <summary>Start on background thread, await completion of setup.</summary>
     public Task<bool> StartAsync()
     {
         return Task.Run(() =>
@@ -80,22 +65,22 @@ public class DynamicPortListener : IDisposable
             if (IsRunning) return true;
             _cts = new CancellationTokenSource();
 
-            // 1. Hosts file redirect
-            try { ModifyHosts(add: true); } catch (Exception ex) { _log.Error($"Hosts: {ex.Message}"); return false; }
+            try { ModifyHosts(add: true); }
+            catch (Exception ex) { _log.Error($"Hosts: {ex.Message}"); return false; }
 
-            // 2. Open WinDivert (sniff only, pass through)
             string filter = "outbound and tcp.Syn and not tcp.Ack and not ip.DstAddr == 127.0.0.1";
             _handle = WinDivertOpen(filter, 0, 0, 0);
             if (_handle == IntPtr.Zero) { _log.Error("WinDivertOpen failed"); return false; }
             _log.Info("WinDivert opened");
 
-            // 3. Known port listeners
             foreach (var port in KnownPorts)
                 TryCreateListener(port);
 
-            // 4. Background loops
-            _ = Task.Run(() => SniffLoop());
-            _ = Task.Run(() => DnsRefreshLoop());
+            // Sniff on a dedicated STA thread so WinDivertRecv has stable context
+            _sniffThread = new Thread(SniffLoop) { IsBackground = true, Name = "WinDivertSniff" };
+            _sniffThread.Start();
+
+            _ = Task.Run(DnsRefreshLoop);
 
             IsRunning = true;
             _log.Info("DynamicPortListener started");
@@ -112,9 +97,8 @@ public class DynamicPortListener : IDisposable
             l.Start();
             _listeners[port] = l;
             _ = AcceptLoopAsync(l, port, _cts!.Token, isDynamic: false);
-            _log.Info($"Listener 127.0.0.1:{port}");
         }
-        catch (Exception ex) { _log.Warn($"Port {port}: {ex.Message}"); }
+        catch (Exception ex) { _log.Warn($"Listen {port}: {ex.Message}"); }
     }
 
     private void SniffLoop()
@@ -130,30 +114,20 @@ public class DynamicPortListener : IDisposable
                 if (!WinDivertRecv(_handle, buf, BufSize, ref addr, ref recvLen))
                 { Thread.Sleep(10); continue; }
 
-                // Parse packet
-                IntPtr ipH = IntPtr.Zero, tcpH = IntPtr.Zero;
-                IntPtr ip6 = IntPtr.Zero, icmp = IntPtr.Zero, icmp6 = IntPtr.Zero;
-                IntPtr udp = IntPtr.Zero, data = IntPtr.Zero; int dLen = 0; IntPtr end = IntPtr.Zero;
-                WinDivertHelperParsePacket(buf, recvLen, ref ipH, ref ip6, ref icmp, ref icmp6,
-                    ref tcpH, ref udp, ref data, ref dLen, ref end);
+                // Extract dest port from raw packet
+                if (recvLen < 40) continue;
+                int dstPort = (buf[22] << 8) | buf[23];
+                uint dstAddr = (uint)(buf[16] | (buf[17] << 8) | (buf[18] << 16) | (buf[19] << 24));
 
-                // Pass-through always
-                WinDivertSend(_handle, buf, recvLen, ref addr, ref recvLen);
+                byte flags = buf[33];
+                bool isSyn = (flags & 0x02) != 0;
+                bool isAck = (flags & 0x10) != 0;
+                if (!isSyn || isAck) continue;
 
-                if (ipH == IntPtr.Zero || tcpH == IntPtr.Zero) continue;
-                var ip = Marshal.PtrToStructure<IPHDR>(ipH);
-                var tcp = Marshal.PtrToStructure<TCPHDR>(tcpH);
-
-                byte flags = (byte)(tcp.FlagsAndOffset & 0xFF);
-                if ((flags & 0x02) == 0 || (flags & 0x10) != 0) continue; // SYN only
-
-                var dstIp = new IPAddress(BitConverter.GetBytes(ip.DstAddr).Reverse().ToArray());
-                int dstPort = (ushort)IPAddress.NetworkToHostOrder((short)tcp.DstPort);
-
+                var dstIp = new IPAddress(BitConverter.GetBytes(dstAddr).Reverse().ToArray());
                 if (dstIp.Equals(IPAddress.Loopback)) continue;
                 if (!IsTargetIp(dstIp)) continue;
 
-                // Create listener on-demand
                 if (!_listeners.ContainsKey(dstPort))
                 {
                     try
@@ -164,7 +138,7 @@ public class DynamicPortListener : IDisposable
                         _ = AcceptLoopAsync(l, dstPort, _cts.Token, isDynamic: true);
                         _log.Info($"Dynamic listener port {dstPort}");
                     }
-                    catch { /* port in use or unavailable */ }
+                    catch { }
                 }
             }
             catch (Exception ex) { _log.Warn($"Sniff: {ex.Message}"); }
@@ -201,7 +175,8 @@ public class DynamicPortListener : IDisposable
             await socks.ConnectThroughProxyAsync(_targetDomain, port);
 
             using var clientStream = client.GetStream();
-            await new TcpRelay(clientStream, socks.GetStream()).RunAsync(CancellationToken.None);
+            var relay = new TcpRelay(clientStream, socks.GetStream());
+            await relay.RunAsync(CancellationToken.None);
         }
         catch (Exception ex) { _log.Warn($"Relay port {port}: {ex.Message}"); }
         finally { client.Dispose(); }
@@ -236,7 +211,6 @@ public class DynamicPortListener : IDisposable
         string entry = "127.0.0.1 cschannel.anticheatexpert.com";
         var lines = File.ReadAllLines(hostsPath).ToList();
         bool exists = lines.Any(l => l.Contains("cschannel.anticheatexpert.com"));
-
         if (add && !exists) { lines.Add(entry); File.WriteAllLines(hostsPath, lines); }
         else if (!add && exists) { lines.RemoveAll(l => l.Contains("cschannel.anticheatexpert.com")); File.WriteAllLines(hostsPath, lines); }
     }
@@ -245,10 +219,24 @@ public class DynamicPortListener : IDisposable
     {
         if (!IsRunning) return;
         IsRunning = false;
+
+        // Cancel all loops
         _cts?.Cancel();
-        if (_handle != IntPtr.Zero) { WinDivertClose(_handle); _handle = IntPtr.Zero; }
-        foreach (var (_, l) in _listeners) { try { l.Stop(); } catch { } }
-        _listeners.Clear();
+        _sniffThread = null;
+
+        // Close all listeners (on bg thread to avoid blocking UI)
+        Task.Run(() =>
+        {
+            foreach (var (_, l) in _listeners) { try { l.Stop(); } catch { } }
+            _listeners.Clear();
+        });
+
+        // Close WinDivert handle on bg thread (may block)
+        var h = _handle;
+        _handle = IntPtr.Zero;
+        if (h != IntPtr.Zero)
+            Task.Run(() => WinDivertClose(h));
+
         try { ModifyHosts(add: false); } catch { }
         _log.Info("DynamicPortListener stopped");
     }
@@ -256,7 +244,6 @@ public class DynamicPortListener : IDisposable
     public void Dispose() { Stop(); _cts?.Dispose(); }
 }
 
-/// <summary>Bidirectional TCP relay.</summary>
 public class TcpRelay
 {
     private readonly NetworkStream _a, _b;
